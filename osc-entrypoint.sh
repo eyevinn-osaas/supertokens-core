@@ -23,13 +23,13 @@ CONFIG_FILE="${TEMP_DIR}/config.yaml"
     [ -n "$POSTGRESQL_PASSWORD" ]       && echo "postgresql_password: $POSTGRESQL_PASSWORD"
     [ -n "$POSTGRESQL_DATABASE_NAME" ]  && echo "postgresql_database_name: $POSTGRESQL_DATABASE_NAME"
 
-    [ -n "$API_KEYS" ]                          && echo "api_keys: $API_KEYS"
+    [ -n "$API_KEYS" ]                           && echo "api_keys: $API_KEYS"
     [ -n "$OAUTH_CLIENT_SECRET_ENCRYPTION_KEY" ] && echo "oauth_client_secret_encryption_key: $OAUTH_CLIENT_SECRET_ENCRYPTION_KEY"
-    [ -n "$ACCESS_TOKEN_VALIDITY" ]             && echo "access_token_validity: $ACCESS_TOKEN_VALIDITY"
-    [ -n "$REFRESH_TOKEN_VALIDITY" ]            && echo "refresh_token_validity: $REFRESH_TOKEN_VALIDITY"
-    [ -n "$PASSWORD_HASHING_ALG" ]              && echo "password_hashing_alg: $PASSWORD_HASHING_ALG"
-    [ -n "$LOG_LEVEL" ]                         && echo "log_level: $LOG_LEVEL"
-    [ -n "$IP_ALLOW_REGEX" ]                    && echo "ip_allow_regex: $IP_ALLOW_REGEX"
+    [ -n "$ACCESS_TOKEN_VALIDITY" ]              && echo "access_token_validity: $ACCESS_TOKEN_VALIDITY"
+    [ -n "$REFRESH_TOKEN_VALIDITY" ]             && echo "refresh_token_validity: $REFRESH_TOKEN_VALIDITY"
+    [ -n "$PASSWORD_HASHING_ALG" ]               && echo "password_hashing_alg: $PASSWORD_HASHING_ALG"
+    [ -n "$LOG_LEVEL" ]                          && echo "log_level: $LOG_LEVEL"
+    [ -n "$IP_ALLOW_REGEX" ]                     && echo "ip_allow_regex: $IP_ALLOW_REGEX"
 
     echo "disable_telemetry: true"
     echo "info_log_path: null"
@@ -38,10 +38,10 @@ CONFIG_FILE="${TEMP_DIR}/config.yaml"
 
 chown -R supertokens:supertokens "$TEMP_DIR" 2>/dev/null || true
 
-exec gosu supertokens /usr/lib/supertokens/jre/bin/java \
-    -classpath "/usr/lib/supertokens/core/*:/usr/lib/supertokens/plugin-interface/*:/usr/lib/supertokens/ee/*" \
+exec gosu supertokens /opt/supertokens/jre/bin/java \
+    -classpath "/opt/supertokens/core/*:/opt/supertokens/plugin-interface/*:/opt/supertokens/ee/*" \
     io.supertokens.Main \
-    /usr/lib/supertokens \
+    /opt/supertokens \
     DEV \
     "configFile=${CONFIG_FILE}" \
     "tempDirLocation=${TEMP_DIR}"
