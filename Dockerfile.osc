@@ -2,11 +2,15 @@ FROM supertokens/supertokens-postgresql:10.1
 
 USER root
 
+# Copy supertokens files to /opt/supertokens so they are outside the
+# /usr/lib/supertokens PVC mount path which would shadow them at runtime
+RUN cp -a /usr/lib/supertokens /opt/supertokens
+
 COPY --chmod=755 osc-entrypoint.sh /usr/local/bin/osc-entrypoint.sh
 
 EXPOSE 8080
 
 ENTRYPOINT ["/usr/local/bin/osc-entrypoint.sh"]
-CMD ["/usr/lib/supertokens/jre/bin/java", \
-     "-classpath", "/usr/lib/supertokens/core/*:/usr/lib/supertokens/plugin-interface/*:/usr/lib/supertokens/ee/*", \
-     "io.supertokens.Main", "/usr/lib/supertokens", "DEV"]
+CMD ["/opt/supertokens/jre/bin/java", \
+     "-classpath", "/opt/supertokens/core/*:/opt/supertokens/plugin-interface/*:/opt/supertokens/ee/*", \
+     "io.supertokens.Main", "/opt/supertokens", "DEV"]
