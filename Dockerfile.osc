@@ -31,6 +31,7 @@ RUN apt-get update && \
         curl \
         ca-certificates \
         wget \
+        openjdk-17-jre-headless \
     && rm -rf /var/lib/apt/lists/*
 
 RUN DEBIAN_FRONTEND=noninteractive TZ=Etc/UTC apt-get update && \
@@ -43,6 +44,10 @@ RUN set -x \
 
 COPY --from=builder --chown=supertokens /usr/lib/supertokens /usr/lib/supertokens
 COPY --from=builder --chown=supertokens /usr/bin/supertokens /usr/bin/supertokens
+
+# Ensure supertokens can find java at its expected path
+RUN mkdir -p /usr/lib/supertokens/jre/bin && \
+    ln -sf /usr/bin/java /usr/lib/supertokens/jre/bin/java
 
 COPY --chmod=755 osc-entrypoint.sh /usr/local/bin/osc-entrypoint.sh
 
