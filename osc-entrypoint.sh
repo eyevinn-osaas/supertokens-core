@@ -7,7 +7,10 @@ mkdir -p "$TEMP_DIR"
 
 CONFIG_FILE="${TEMP_DIR}/config.yaml"
 
-# Build config from scratch
+# Start from the shipped config.yaml (provides core_config_version and defaults)
+cp /opt/supertokens/config.yaml "$CONFIG_FILE"
+
+# Override/append OSC platform settings
 {
     echo "host: 0.0.0.0"
     echo "port: ${PORT}"
@@ -34,7 +37,7 @@ CONFIG_FILE="${TEMP_DIR}/config.yaml"
     echo "disable_telemetry: true"
     echo "info_log_path: null"
     echo "error_log_path: null"
-} > "$CONFIG_FILE"
+} >> "$CONFIG_FILE"
 
 chown -R supertokens:supertokens "$TEMP_DIR" 2>/dev/null || true
 
