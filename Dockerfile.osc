@@ -44,8 +44,6 @@ RUN set -x \
 COPY --from=builder --chown=supertokens /usr/lib/supertokens /usr/lib/supertokens
 COPY --from=builder --chown=supertokens /usr/bin/supertokens /usr/bin/supertokens
 
-RUN echo "$(md5sum /usr/lib/supertokens/config.yaml | awk '{ print $1 }')" >> /CONFIG_HASH
-
 COPY --chmod=755 osc-entrypoint.sh /usr/local/bin/osc-entrypoint.sh
 
 EXPOSE 8080
