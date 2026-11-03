@@ -1,14 +1,14 @@
 import json
 import os
-import subprocess
 
 import http.client
 
 
-def register_plugin_version(supertokens_api_key, plugin_version, plugin_interface_array, plugin_name):
+def register_plugin_version(supertokens_api_key, plugin_version, plugin_interface_array, plugin_name, is_canary):
     print("Plugin Version: ", plugin_version)
     print("Plugin Interface Array: ", plugin_interface_array)
     print("Plugin Name: ", plugin_name)
+    print("Is Canary: ", is_canary)
 
     conn = http.client.HTTPSConnection("api.supertokens.io")
 
@@ -17,7 +17,8 @@ def register_plugin_version(supertokens_api_key, plugin_version, plugin_interfac
         "planType": "FREE",
         "version": plugin_version,
         "pluginInterfaces": plugin_interface_array,
-        "name": plugin_name
+        "name": plugin_name,
+        "isCanary": is_canary
     }
 
     headers = {
@@ -47,22 +48,10 @@ plugin_version = read_plugin_version()
 with open('pluginInterfaceSupported.json', 'r') as fd:
 	plugin_interface_array = json.load(fd)['versions']
 
-def check_if_tag_exists(tag):
-    try:
-        result = subprocess.run(['git', 'tag', '-l', tag], capture_output=True, text=True)
-        return tag in result.stdout
-    except subprocess.CalledProcessError:
-        print(f"Error checking for tag {tag}")
-        return False
-
-dev_tag = f"dev-v{plugin_version}"
-if not check_if_tag_exists(dev_tag):
-    print(f"Tag {dev_tag} does not exist. Exiting!")
-    exit(0)
-
 register_plugin_version(
 	supertokens_api_key=os.environ.get("SUPERTOKENS_API_KEY"),
 	plugin_version=plugin_version,
 	plugin_interface_array=plugin_interface_array,
-	plugin_name=os.environ.get("PLUGIN_NAME")
+	plugin_name=os.environ.get("PLUGIN_NAME"),
+	is_canary=os.environ.get("IS_CANARY", "false").lower() == "true"
 )

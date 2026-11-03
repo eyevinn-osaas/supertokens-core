@@ -20,6 +20,7 @@ import com.auth0.jwt.exceptions.JWTCreationException;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import io.supertokens.ActiveUsers;
+import io.supertokens.pluginInterface.auditlog.ActivityEventType;
 import io.supertokens.Main;
 import io.supertokens.exceptions.TryRefreshTokenException;
 import io.supertokens.featureflag.exceptions.FeatureNotEnabledException;
@@ -39,12 +40,16 @@ import io.supertokens.pluginInterface.multitenancy.TenantIdentifier;
 import io.supertokens.pluginInterface.multitenancy.exceptions.TenantOrAppNotFoundException;
 import io.supertokens.pluginInterface.oauth.OAuthClient;
 import io.supertokens.pluginInterface.oauth.exception.OAuthClientNotFoundException;
+import io.supertokens.pluginInterface.oauth.sqlStorage.OAuthSQLStorage;
 import io.supertokens.pluginInterface.session.SessionInfo;
 import io.supertokens.pluginInterface.useridmapping.UserIdMapping;
 import io.supertokens.session.Session;
 import io.supertokens.session.jwt.JWT.JWTException;
+import io.supertokens.signingkeys.JWTSigningKey;
+import io.supertokens.signingkeys.SigningKeys;
 import io.supertokens.storageLayer.StorageLayer;
 import io.supertokens.useridmapping.UserIdType;
+import io.supertokens.output.Logging;
 import io.supertokens.utils.Utils;
 import io.supertokens.webserver.InputParser;
 import io.supertokens.webserver.WebserverAPI;
@@ -63,9 +68,24 @@ import java.security.spec.InvalidKeySpecException;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.locks.ReentrantLock;
+import io.supertokens.auditlog.UnauditedTransaction;
 
 public class OAuthTokenAPI extends WebserverAPI {
+
+    /**
+     * Per-external-refresh-token JVM lock (outer layer of a two-layer mutex).
+     *
+     * <p>Ensures at most one thread per token <em>per JVM instance</em> enters the
+     * critical section at a time.  Because threads wait here without holding a DB
+     * connection, this prevents connection-pool exhaustion even when the inner DB
+     * transaction ({@code SELECT … FOR UPDATE}) spans several Hydra HTTP calls.
+     *
+     * <p>Entries are never removed; their footprint is negligible compared to the
+     * sessions they represent.
+     */
+    private static final ConcurrentHashMap<String, ReentrantLock> REFRESH_LOCKS =
+            new ConcurrentHashMap<>();
 
     public OAuthTokenAPI(Main main) {
         super(main, RECIPE_ID.OAUTH.toString());
@@ -92,27 +112,8 @@ public class OAuthTokenAPI extends WebserverAPI {
 
         String authorizationHeader = InputParser.parseStringOrThrowError(input, "authorizationHeader", true);
 
-        if (grantType.equals("refresh_token")) {
-            String refreshTokenForLock = InputParser.parseStringOrThrowError(bodyFromSDK, "refresh_token", false);
-            NamedLockObject entry = lockMap.computeIfAbsent(refreshTokenForLock, k -> new NamedLockObject());
-            try {
-                entry.refCount.incrementAndGet();
-                synchronized (entry.obj) {
-                    handle(req, resp, authorizationHeader, bodyFromSDK, grantType, iss, accessTokenUpdate,
-                            idTokenUpdate,
-                            useDynamicKey);
-                }
-            } finally {
-                entry.refCount.decrementAndGet();
-                if (entry.refCount.get() == 0) {
-                    lockMap.remove(refreshTokenForLock, entry);
-                }
-            }
-
-        } else {
-            handle(req, resp, authorizationHeader, bodyFromSDK, grantType, iss, accessTokenUpdate, idTokenUpdate,
-                    useDynamicKey);
-        }
+        handle(req, resp, authorizationHeader, bodyFromSDK, grantType, iss, accessTokenUpdate, idTokenUpdate,
+                useDynamicKey);
     }
 
     private void handle(HttpServletRequest req, HttpServletResponse resp, String authorizationHeader,
@@ -124,17 +125,21 @@ public class OAuthTokenAPI extends WebserverAPI {
         }
 
         Map<String, String> formFields = new HashMap<>();
-        for (Map.Entry<String, JsonElement> entry : bodyFromSDK.entrySet()) {
-            formFields.put(entry.getKey(), entry.getValue().getAsString());
-        }
-
         String clientId;
+        try {
+            for (Map.Entry<String, JsonElement> entry : bodyFromSDK.entrySet()) {
+                formFields.put(entry.getKey(), entry.getValue().getAsString());
+            }
 
-        if (authorizationHeader != null) {
-            String[] parsedHeader = Utils.convertFromBase64(authorizationHeader.replaceFirst("^Basic ", "").trim()).split(":");
-            clientId = parsedHeader[0];
-        } else {
-            clientId = formFields.get("client_id");
+            if (authorizationHeader != null) {
+                String[] parsedHeader = Utils.convertFromBase64(authorizationHeader.replaceFirst("^Basic ", "").trim()).split(":");
+                clientId = parsedHeader[0];
+            } else {
+                clientId = formFields.get("client_id");
+            }
+        } catch (RuntimeException e) {
+            // non-primitive body values / malformed Basic auth header
+            throw new ServletException(new BadRequestException("malformed request body or authorization header"));
         }
 
         try {
@@ -148,6 +153,15 @@ public class OAuthTokenAPI extends WebserverAPI {
             if (grantType.equals("refresh_token")) {
                 String refreshToken = InputParser.parseStringOrThrowError(bodyFromSDK, "refresh_token", false);
                 inputRefreshToken = refreshToken;
+
+                // Non-rotating refresh: serialize at the DB level so concurrent requests from
+                // multiple core instances all succeed by taking turns on the same row lock.
+                if (!oauthClient.enableRefreshTokenRotation) {
+                    handleNonRotatingRefreshWithLock(req, resp, appIdentifier, storage, oauthClient,
+                            inputRefreshToken, formFields, headers, iss, accessTokenUpdate, idTokenUpdate,
+                            useDynamicKey);
+                    return;
+                }
 
                 String internalRefreshToken = OAuth.getInternalRefreshToken(main, appIdentifier, storage, refreshToken);
 
@@ -309,9 +323,11 @@ public class OAuthTokenAPI extends WebserverAPI {
             UserIdMapping userIdMapping = io.supertokens.useridmapping.UserIdMapping.getUserIdMapping(
                     appIdentifier, storage, sessionInfo.userId, UserIdType.ANY);
             if (userIdMapping != null) {
-                ActiveUsers.updateLastActive(appIdentifier, main, userIdMapping.superTokensUserId);
+                ActiveUsers.updateLastActive(tenantIdentifier, main, userIdMapping.superTokensUserId,
+                        ActivityEventType.OAUTH_TOKEN_EXCHANGE);
             } else {
-                ActiveUsers.updateLastActive(appIdentifier, main, sessionInfo.userId);
+                ActiveUsers.updateLastActive(tenantIdentifier, main, sessionInfo.userId,
+                        ActivityEventType.OAUTH_TOKEN_EXCHANGE);
             }
         } catch (Exception e) {
             // ignore
@@ -319,9 +335,310 @@ public class OAuthTokenAPI extends WebserverAPI {
     }
 
 
-    private static class NamedLockObject {
-        final Object obj = new Object();
-        final AtomicInteger refCount = new AtomicInteger(0);
+    /**
+     * Handles a non-rotating OAuth refresh token exchange with a two-layer mutex:
+     *
+     * <ol>
+     *   <li><b>JVM {@link ReentrantLock}</b> (outer) — serialises concurrent requests within
+     *       this JVM instance without holding a DB connection while waiting.</li>
+     *   <li><b>DB {@code SELECT … FOR UPDATE}</b> (inner, SQL storage only) — row-level exclusive
+     *       lock held for the full Hydra round-trip, serialising requests across multiple
+     *       SuperTokens instances that share the same database.</li>
+     * </ol>
+     *
+     * <p>Because the JVM lock ensures at most one thread per instance is inside the DB
+     * transaction at a time, holding the connection during Hydra HTTP calls cannot exhaust
+     * the connection pool.</p>
+     *
+     * <p>For non-SQL storage backends the JVM lock alone is used (no DB-level locking).</p>
+     */
+    private void handleNonRotatingRefreshWithLock(
+            HttpServletRequest req, HttpServletResponse resp,
+            AppIdentifier appIdentifier, Storage storage, OAuthClient oauthClient,
+            String externalRefreshToken, Map<String, String> formFields, Map<String, String> headers,
+            String iss, JsonObject accessTokenUpdate, JsonObject idTokenUpdate, boolean useDynamicKey)
+            throws IOException, ServletException {
+
+        String lockKey = appIdentifier.getAppId() + ":" + externalRefreshToken;
+        ReentrantLock lock = REFRESH_LOCKS.computeIfAbsent(lockKey, k -> new ReentrantLock());
+        boolean contended = lock.isLocked();
+        if (contended) {
+            Logging.debug(main, appIdentifier.getAsPublicTenantIdentifier(),
+                    "OAuth non-rotating refresh: lock contended for token ...'"
+                            + tokenSuffix(externalRefreshToken) + "' — queuing");
+        }
+        lock.lock();
+        try {
+            if (storage instanceof OAuthSQLStorage) {
+                handleNonRotatingRefresh(req, resp, appIdentifier, (OAuthSQLStorage) storage, oauthClient,
+                        externalRefreshToken, formFields, headers, iss, accessTokenUpdate, idTokenUpdate,
+                        useDynamicKey);
+            } else {
+                throw new IllegalStateException("invalid storage for OAuth");
+            }
+        } finally {
+            lock.unlock();
+        }
     }
-    private static final ConcurrentHashMap<String, NamedLockObject> lockMap = new ConcurrentHashMap<>();
+
+    /**
+     * SQL path: DB transaction with {@code SELECT … FOR UPDATE} covering the full Hydra
+     * round-trip. The caller must already hold the JVM lock for this token.
+     */
+    @UnauditedTransaction(justification = "Legacy unaudited transaction (PLAN-012 backlog); pending conversion to startAuditedTransaction or read-only exemption.")
+    private void handleNonRotatingRefresh(
+            HttpServletRequest req, HttpServletResponse resp,
+            AppIdentifier appIdentifier, OAuthSQLStorage sqlStorage, OAuthClient oauthClient,
+            String externalRefreshToken, Map<String, String> formFields, Map<String, String> headers,
+            String iss, JsonObject accessTokenUpdate, JsonObject idTokenUpdate, boolean useDynamicKey)
+            throws IOException, ServletException {
+
+        final JsonObject[] finalResponse = {null};
+        // Session handle from the re-signed access token, for the best-effort updateLastActive after the commit.
+        final String[] sessionHandleForLastActive = {null};
+
+        // Pre-warm the signing-key caches OUTSIDE the transaction so that token re-signing and JWT payload
+        // verification inside the transaction below are served from cache and never borrow a second pool
+        // connection while the outer connection is held. Any cold-start key creation or dynamic-key rotation
+        // happens here, where this thread holds no connection. Mirrors Session#warmSigningMaterial and the
+        // deadlock note on SigningKeys#getStaticKeyForAlgorithm (PLAN-017).
+        try {
+            SigningKeys signingKeys = SigningKeys.getInstance(appIdentifier, main);
+            signingKeys.getAllKeys(); // used by getPayloadFromJWTToken to verify the exchanged access token
+            if (useDynamicKey) {
+                signingKeys.getLatestIssuedDynamicKey();
+            } else {
+                signingKeys.getStaticKeyForAlgorithm(JWTSigningKey.SupportedAlgorithms.RS256);
+            }
+        } catch (StorageQueryException | StorageTransactionLogicException | TenantOrAppNotFoundException
+                 | UnsupportedJWTSigningAlgorithmException e) {
+            throw new ServletException(e);
+        }
+
+        try {
+            sqlStorage.startTransaction(con -> {
+                // Tracked purely for CORE-3 diagnostics (PLAN-017): once the provider exchange has succeeded,
+                // any later failure that rolls back this transaction is a stranded-mapping risk we debug-log.
+                boolean exchangeSucceeded = false;
+                String gid = null;
+                try {
+                    // ── 1. SELECT … FOR UPDATE ─────────────────────────────────────
+                    String internalToken = sqlStorage.getRefreshTokenMappingForUpdate_Transaction(
+                            appIdentifier, con, externalRefreshToken);
+                    // Null means no mapping yet (auth-code path stores null); fall back
+                    // to using the external token directly — same as getInternalRefreshToken.
+                    if (internalToken == null) {
+                        internalToken = externalRefreshToken;
+                    }
+
+                    // ── 2. Introspect internal token with Hydra ────────────────────
+                    Map<String, String> introspectFields = new HashMap<>();
+                    introspectFields.put("token", internalToken);
+                    HttpRequestForOAuthProvider.Response introspectResp = OAuthProxyHelper.proxyFormPOST(
+                            main, req, resp, appIdentifier, sqlStorage,
+                            null, "/admin/oauth2/introspect", true, false,
+                            introspectFields, new HashMap<>());
+                    if (introspectResp == null) return null; // already responded; auto-rollback
+
+                    JsonObject refreshTokenPayload = introspectResp.jsonResponse.getAsJsonObject();
+                    // Run the revocation read on the outer connection `con` (not a nested borrow) and reuse
+                    // the already-loaded oauthClient for the revoke round-trip — see PLAN-017.
+                    OAuth.verifyAndUpdateIntrospectRefreshTokenPayload(main, appIdentifier, sqlStorage,
+                            con, refreshTokenPayload, externalRefreshToken, oauthClient);
+
+                    if (!refreshTokenPayload.get("active").getAsBoolean()) {
+                        String gidForLog = refreshTokenPayload.has("gid")
+                                ? refreshTokenPayload.get("gid").getAsString() : "?";
+                        Logging.warn(main, appIdentifier.getAsPublicTenantIdentifier(),
+                                "OAuth non-rotating refresh: token_inactive — ext=...'"
+                                        + tokenSuffix(externalRefreshToken) + "' gid=" + gidForLog);
+                        OAuthProxyHelper.handleOAuthAPIException(resp, new OAuthAPIException(
+                                "token_inactive",
+                                "Token is inactive because it is malformed, expired or otherwise invalid. Token validation failed.",
+                                401));
+                        return null; // already responded; auto-rollback
+                    }
+
+                    // ── 3. Exchange with Hydra ─────────────────────────────────────
+                    // Pass clientIdToCheck = null: the client existence check is redundant here because
+                    // oauthClient was already loaded and validated via OAuth.getOAuthClientById at the API
+                    // entry (OAuthTokenAPI#handle), so the client provably exists for this request. A
+                    // non-null clientIdToCheck would
+                    // make doOAuthProxyFormPOST re-run getOAuthClientById — a non-transactional read that
+                    // borrows a second pool connection while the outer `con` is held, the exact hold-and-wait
+                    // nested borrow this fix removes (PLAN-017 §5.3).
+                    formFields.put("refresh_token", internalToken);
+                    HttpRequestForOAuthProvider.Response exchangeResp = OAuthProxyHelper.proxyFormPOST(
+                            main, req, resp, appIdentifier, sqlStorage,
+                            null, "/oauth2/token", false, false,
+                            formFields, headers);
+                    if (exchangeResp == null) {
+                        Logging.warn(main, appIdentifier.getAsPublicTenantIdentifier(),
+                                "OAuth non-rotating refresh: Hydra exchange failed (null response) — ext=...'"
+                                        + tokenSuffix(externalRefreshToken) + "'");
+                        return null; // already responded; auto-rollback
+                    }
+                    // Provider has now (re)issued tokens. From here on, a rollback strands the local mapping
+                    // while the provider has already rotated — the atomicity gap we log at warn below (PLAN-017 CORE-3).
+                    exchangeSucceeded = true;
+
+                    // ── 4. Transform tokens ────────────────────────────────────────
+                    // useCacheOnlySigningKey = true: re-sign from the pre-warmed key caches only, so signing
+                    // never borrows a second connection while `con` is held (PLAN-017).
+                    exchangeResp.jsonResponse = OAuth.transformTokens(main, appIdentifier, sqlStorage,
+                            exchangeResp.jsonResponse.getAsJsonObject(),
+                            iss, accessTokenUpdate, idTokenUpdate, useDynamicKey, true);
+
+                    // ── 5. Extract gid / jti / sessionHandle ───────────────────────
+                    String jti = null, sessionHandle = null;
+                    if (exchangeResp.jsonResponse.getAsJsonObject().has("access_token")) {
+                        try {
+                            // Cache-only key read: a rotation window that opened during the provider calls
+                            // must not refresh the key cache (a nested transaction) while `con` is held.
+                            JsonObject atPayload = OAuthToken.getPayloadFromJWTToken(appIdentifier, main,
+                                    exchangeResp.jsonResponse.getAsJsonObject()
+                                            .get("access_token").getAsString(), true);
+                            gid = atPayload.get("gid").getAsString();
+                            jti = atPayload.get("jti").getAsString();
+                            if (atPayload.has("sessionHandle")) {
+                                sessionHandle = atPayload.get("sessionHandle").getAsString();
+                                // updateLastActive is best-effort side work that may target a DIFFERENT
+                                // tenant's storage/pool than the one holding `con`, so it must NOT be threaded
+                                // onto `con` (that would run it against the wrong storage). Its reads would
+                                // borrow a second connection while `con` is held, so it runs after the commit,
+                                // below (PLAN-017 §5.4).
+                                sessionHandleForLastActive[0] = sessionHandle;
+                            }
+                        } catch (TryRefreshTokenException e) {
+                            Logging.debug(main, appIdentifier.getAsPublicTenantIdentifier(),
+                                    "OAuth non-rotating refresh: gid/jti extraction from the re-signed access token"
+                                            + " was skipped — ext=...'" + tokenSuffix(externalRefreshToken)
+                                            + "' — " + e);
+                            // ignore — shouldn't happen
+                        }
+                    }
+
+                    // ── 6. UPDATE + commit ─────────────────────────────────────────
+                    if (exchangeResp.jsonResponse.getAsJsonObject().has("refresh_token")) {
+                        String newInternalToken = exchangeResp.jsonResponse.getAsJsonObject()
+                                .get("refresh_token").getAsString();
+
+                        // Introspect the new Hydra token to get its expiry.
+                        // Use doOAuthProxyFormPOST directly (not proxyFormPOST) so we can
+                        // retry on transient OAuthAPIException without proxyFormPOST having
+                        // already written an error HTTP response before returning null.
+                        Map<String, String> newIntrospectFields = new HashMap<>();
+                        newIntrospectFields.put("token", newInternalToken);
+                        long refreshTokenExp = refreshTokenPayload.get("exp").getAsLong(); // fallback
+                        boolean introspectSucceeded = false;
+                        for (int attempt = 0; attempt < 3; attempt++) {
+                            try {
+                                if (attempt > 0) {
+                                    Thread.sleep(50L << attempt); // 100 ms, 200 ms
+                                }
+                                HttpRequestForOAuthProvider.Response newIntrospectResp =
+                                        OAuth.doOAuthProxyFormPOST(
+                                                main, appIdentifier, sqlStorage, null,
+                                                "/admin/oauth2/introspect", true, false,
+                                                newIntrospectFields, new HashMap<>());
+                                refreshTokenExp = newIntrospectResp.jsonResponse
+                                        .getAsJsonObject().get("exp").getAsLong();
+                                introspectSucceeded = true;
+                                break;
+                            } catch (OAuthAPIException e) {
+                                Logging.warn(main, appIdentifier.getAsPublicTenantIdentifier(),
+                                        "OAuth non-rotating refresh: post-exchange introspect attempt "
+                                                + (attempt + 1) + "/3 failed — " + e.error
+                                                + " — ext=...'" + tokenSuffix(externalRefreshToken) + "'");
+                            } catch (InterruptedException ie) {
+                                Thread.currentThread().interrupt();
+                                break;
+                            }
+                        }
+                        if (!introspectSucceeded) {
+                            Logging.warn(main, appIdentifier.getAsPublicTenantIdentifier(),
+                                    "OAuth non-rotating refresh: post-exchange introspect exhausted all retries,"
+                                            + " falling back to pre-exchange expiry="
+                                            + refreshTokenExp
+                                            + " — ext=...'" + tokenSuffix(externalRefreshToken) + "'");
+                        }
+
+                        try {
+                            sqlStorage.updateOAuthSessionInternal_Transaction(appIdentifier, con, gid,
+                                    newInternalToken, sessionHandle, jti, refreshTokenExp);
+                        } catch (StorageQueryException e) {
+                            // Diagnostic only (PLAN-017 CORE-3): the provider exchange already succeeded, so this
+                            // rollback leaves the local mapping behind the provider (stranded-mapping risk). Logged at
+                            // warn — a data-integrity divergence, per reviewer. Rethrow unchanged — no control-flow,
+                            // response, retry or rollback change.
+                            Logging.warn(main, appIdentifier.getAsPublicTenantIdentifier(),
+                                    "OAuth non-rotating refresh: local mapping update failed after a successful"
+                                            + " provider exchange — transaction will roll back (stranded-mapping"
+                                            + " risk), ext=...'" + tokenSuffix(externalRefreshToken) + "' gid="
+                                            + (gid == null ? "?" : gid) + " — " + e);
+                            throw e;
+                        }
+                    }
+
+                    try {
+                        sqlStorage.commitTransaction(con);
+                    } catch (StorageQueryException e) {
+                        // Diagnostic only (PLAN-017 CORE-3): commit failed even though the provider exchange
+                        // succeeded, so the local mapping rolls back while the provider already rotated. Logged at
+                        // warn — a data-integrity divergence, per reviewer. Rethrow unchanged — same rollback and
+                        // error response as before.
+                        Logging.warn(main, appIdentifier.getAsPublicTenantIdentifier(),
+                                "OAuth non-rotating refresh: commit failed after a successful provider exchange —"
+                                        + " local mapping rolled back (stranded-mapping risk), ext=...'"
+                                        + tokenSuffix(externalRefreshToken) + "' gid=" + (gid == null ? "?" : gid)
+                                        + " — " + e);
+                        throw e;
+                    }
+
+                    exchangeResp.jsonResponse.getAsJsonObject().remove("refresh_token");
+                    exchangeResp.jsonResponse.getAsJsonObject().addProperty("status", "OK");
+                    finalResponse[0] = exchangeResp.jsonResponse.getAsJsonObject();
+
+                } catch (IOException | TenantOrAppNotFoundException | FeatureNotEnabledException
+                         | InvalidConfigException | InvalidKeyException | NoSuchAlgorithmException
+                         | InvalidKeySpecException | JWTCreationException | JWTException
+                         | UnsupportedJWTSigningAlgorithmException | OAuthClientNotFoundException
+                         | ServletException e) {
+                    if (exchangeSucceeded) {
+                        // Diagnostic only (PLAN-017 CORE-3): a post-exchange step (e.g. re-signing) failed after
+                        // the provider exchange succeeded, so the transaction rolls back while the provider has
+                        // already rotated (stranded-mapping risk). Logged at warn — a data-integrity divergence, per
+                        // reviewer. Behaviour unchanged — the same exception is still wrapped and rethrown below.
+                        Logging.warn(main, appIdentifier.getAsPublicTenantIdentifier(),
+                                "OAuth non-rotating refresh: post-exchange step failed after a successful provider"
+                                        + " exchange — transaction will roll back (stranded-mapping risk), ext=...'"
+                                        + tokenSuffix(externalRefreshToken) + "' gid=" + (gid == null ? "?" : gid)
+                                        + " — " + e);
+                    }
+                    throw new StorageTransactionLogicException(e);
+                }
+                return null;
+            });
+
+        } catch (StorageTransactionLogicException e) {
+            if (e.actualException instanceof IOException) throw (IOException) e.actualException;
+            if (e.actualException instanceof ServletException) throw (ServletException) e.actualException;
+            throw new ServletException(e.actualException);
+        } catch (StorageQueryException e) {
+            throw new ServletException(e);
+        }
+
+        // Send response only if the transaction committed (null = error already sent by proxyFormPOST)
+        if (finalResponse[0] != null) {
+            if (sessionHandleForLastActive[0] != null) {
+                updateLastActive(appIdentifier, sessionHandleForLastActive[0]);
+            }
+            super.sendJsonResponse(200, finalResponse[0], resp);
+        }
+    }
+
+    private static String tokenSuffix(String token) {
+        if (token == null || token.length() <= 8) return token;
+        return token.substring(token.length() - 8);
+    }
 }

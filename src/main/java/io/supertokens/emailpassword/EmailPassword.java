@@ -28,10 +28,15 @@ import org.jetbrains.annotations.TestOnly;
 
 import io.supertokens.Main;
 import io.supertokens.ResourceDistributor;
+import io.supertokens.auditlog.AuditLog;
+import io.supertokens.pluginInterface.auditlog.ActivityLogSQLStorage;
+import io.supertokens.pluginInterface.auditlog.AuditLogEvent;
+import io.supertokens.pluginInterface.auditlog.AuditedResult;
+import io.supertokens.auditlog.lifecycle.LifecycleAuditEvent;
 import io.supertokens.authRecipe.AuthRecipe;
 import io.supertokens.config.Config;
 import io.supertokens.config.CoreConfig;
-import io.supertokens.emailpassword.exceptions.EmailChangeNotAllowedException;
+import io.supertokens.pluginInterface.authRecipe.exceptions.EmailChangeNotAllowedException;
 import io.supertokens.emailpassword.exceptions.ResetPasswordInvalidTokenException;
 import io.supertokens.emailpassword.exceptions.UnsupportedPasswordHashingFormatException;
 import io.supertokens.emailpassword.exceptions.WrongCredentialsException;
@@ -49,7 +54,7 @@ import io.supertokens.pluginInterface.emailpassword.PasswordResetTokenInfo;
 import io.supertokens.pluginInterface.emailpassword.exceptions.DuplicateEmailException;
 import io.supertokens.pluginInterface.emailpassword.exceptions.DuplicatePasswordResetTokenException;
 import io.supertokens.pluginInterface.emailpassword.exceptions.DuplicateUserIdException;
-import io.supertokens.pluginInterface.emailpassword.exceptions.UnknownUserIdException;
+import io.supertokens.pluginInterface.authRecipe.exceptions.UnknownUserIdException;
 import io.supertokens.pluginInterface.emailpassword.sqlStorage.EmailPasswordSQLStorage;
 import io.supertokens.pluginInterface.emailverification.sqlStorage.EmailVerificationSQLStorage;
 import io.supertokens.pluginInterface.exceptions.StorageQueryException;
@@ -58,9 +63,13 @@ import io.supertokens.pluginInterface.multitenancy.AppIdentifier;
 import io.supertokens.pluginInterface.multitenancy.TenantConfig;
 import io.supertokens.pluginInterface.multitenancy.TenantIdentifier;
 import io.supertokens.pluginInterface.multitenancy.exceptions.TenantOrAppNotFoundException;
+import io.supertokens.pluginInterface.useridmapping.LockedUser;
+import io.supertokens.pluginInterface.useridmapping.UserLockingStorage;
+import io.supertokens.pluginInterface.useridmapping.UserNotFoundForLockingException;
 import io.supertokens.storageLayer.StorageLayer;
 import io.supertokens.utils.Utils;
 import io.supertokens.webserver.WebserverAPI;
+import io.supertokens.auditlog.UnauditedTransaction;
 
 public class EmailPassword {
 
@@ -113,40 +122,55 @@ public class EmailPassword {
         String hashedPassword = PasswordHashing.getInstance(main)
                 .createHashWithSalt(tenantIdentifier.toAppIdentifier(), password);
 
+        EmailPasswordSQLStorage epStorage = StorageUtils.getEmailPasswordStorage(storage);
+        EmailVerificationSQLStorage evStorage = StorageUtils.getEmailVerificationStorage(storage);
+        ActivityLogSQLStorage auditStorage = (ActivityLogSQLStorage) storage;
+        AppIdentifier appIdentifier = tenantIdentifier.toAppIdentifier();
+        boolean isFakeEmail = Utils.isFakeEmail(email);
+
         while (true) {
             String userId = Utils.getUUID();
             long timeJoined = System.currentTimeMillis();
 
             try {
-                AuthRecipeUserInfo newUser = StorageUtils.getEmailPasswordStorage(storage)
-                        .signUp(tenantIdentifier, userId, email, hashedPassword, timeJoined);
-
-                if (Utils.isFakeEmail(email)) {
+                // Create the user (and, for a fake email, mark it verified) and emit its user_creation event
+                // atomically on the same connection, so the event cannot be lost relative to the creation it
+                // records. The user-id retry loop on DuplicateUserIdException stays outside the transaction.
+                AuthRecipeUserInfo newUser = auditStorage.startAuditedTransaction(appIdentifier, con -> {
                     try {
-                        EmailVerificationSQLStorage evStorage = StorageUtils.getEmailVerificationStorage(storage);
-                        evStorage.startTransaction(con -> {
-                            try {
-                                evStorage.updateIsEmailVerified_Transaction(tenantIdentifier.toAppIdentifier(), con,
-                                        newUser.getSupertokensUserId(), email, true);
-                                evStorage.commitTransaction(con);
-
-                                return null;
-                            } catch (TenantOrAppNotFoundException e) {
-                                throw new StorageTransactionLogicException(e);
-                            }
-                        });
-                        newUser.loginMethods[0].setVerified(); // newly created user has only one loginMethod
-                    } catch (StorageTransactionLogicException e) {
-                        if (e.actualException instanceof TenantOrAppNotFoundException) {
-                            throw (TenantOrAppNotFoundException) e.actualException;
+                        AuthRecipeUserInfo user = epStorage.signUp_Transaction(tenantIdentifier, con, userId, email,
+                                hashedPassword, timeJoined);
+                        if (isFakeEmail) {
+                            // A fake email is treated as pre-verified; do it on the same connection so the user,
+                            // its verification and the user_creation event all commit (or roll back) together.
+                            evStorage.updateIsEmailVerified_Transaction(appIdentifier, con,
+                                    user.getSupertokensUserId(), email, true);
+                            user.loginMethods[0].setVerified(); // newly created user has only one loginMethod
                         }
-                        throw new StorageQueryException(e);
+                        AuditLogEvent event = LifecycleAuditEvent.forUserCreation(appIdentifier,
+                                user.getSupertokensUserId(), tenantIdentifier.getTenantId(), timeJoined);
+                        return new AuditedResult<>(user, event);
+                    } catch (DuplicateUserIdException | DuplicateEmailException e) {
+                        throw new StorageTransactionLogicException(e);
                     }
-                }
+                });
 
+                AuditLog.emit(main, storage, tenantIdentifier, new AuditLogEvent(
+                        tenantIdentifier.getAppId(), tenantIdentifier.getTenantId(),
+                        newUser.getSupertokensUserId(), newUser.getSupertokensUserId(),
+                        "emailpassword_sign_up", "success", "email", email,
+                        System.currentTimeMillis(), null));
                 return newUser;
-            } catch (DuplicateUserIdException ignored) {
-                // we retry with a new userId (while loop)
+            } catch (StorageTransactionLogicException e) {
+                if (e.actualException instanceof DuplicateUserIdException) {
+                    // we retry with a new userId (while loop)
+                    continue;
+                } else if (e.actualException instanceof DuplicateEmailException) {
+                    throw (DuplicateEmailException) e.actualException;
+                } else if (e.actualException instanceof TenantOrAppNotFoundException) {
+                    throw (TenantOrAppNotFoundException) e.actualException;
+                }
+                throw new StorageQueryException(e.actualException);
             }
         }
     }
@@ -167,6 +191,7 @@ public class EmailPassword {
         }
     }
 
+    @UnauditedTransaction(justification = "Legacy unaudited transaction (PLAN-012 backlog); pending conversion to startAuditedTransaction or read-only exemption.")
     public static ImportUserResponse importUserWithPasswordHash(TenantIdentifier tenantIdentifier, Storage storage,
                                                                 Main main, @Nonnull String email,
                                                                 @Nonnull String passwordHash, @Nullable
@@ -216,23 +241,50 @@ public class EmailPassword {
         return response;
     }
 
+    // The transaction opened directly below (the duplicate-email password update) is a non-count-affecting
+    // mutation and remains on the @UnauditedTransaction allowlist (PLAN-012 backlog). The user *import* path,
+    // by contrast, now goes through startAuditedTransaction and emits its user_import event atomically.
+    @UnauditedTransaction(justification = "Legacy unaudited transaction (PLAN-012 backlog); pending conversion to startAuditedTransaction or read-only exemption.")
     public static ImportUserResponse createUserWithPasswordHash(TenantIdentifier tenantIdentifier, Storage storage,
             @Nonnull String email,
             @Nonnull String passwordHash, long timeJoined)
             throws StorageQueryException, DuplicateEmailException, TenantOrAppNotFoundException,
             StorageTransactionLogicException {
         EmailPasswordSQLStorage epStorage = StorageUtils.getEmailPasswordStorage(storage);
+        ActivityLogSQLStorage auditStorage = (ActivityLogSQLStorage) storage;
+        AppIdentifier appIdentifier = tenantIdentifier.toAppIdentifier();
         while (true) {
             String userId = Utils.getUUID();
             try {
-                AuthRecipeUserInfo userInfo = null;
-                userInfo = epStorage.signUp(tenantIdentifier, userId, email, passwordHash, timeJoined);
+                // Create the user and emit its user_creation event atomically on the same connection; the user-id
+                // retry loop on DuplicateUserIdException stays outside the transaction.
+                AuthRecipeUserInfo userInfo = auditStorage.startAuditedTransaction(appIdentifier, con -> {
+                    try {
+                        AuthRecipeUserInfo user = epStorage.signUp_Transaction(tenantIdentifier, con, userId, email,
+                                passwordHash, timeJoined);
+                        // This is the CDI import-with-password-hash path, not an interactive sign-up: emit
+                        // user_import (like bulk import) rather than user_creation, so the imported user counts
+                        // toward user totals but is excluded from the last-active rollup / MAU fold.
+                        AuditLogEvent event = LifecycleAuditEvent.forUserImport(appIdentifier,
+                                user.getSupertokensUserId(), tenantIdentifier.getTenantId(), timeJoined);
+                        return new AuditedResult<>(user, event);
+                    } catch (DuplicateUserIdException | DuplicateEmailException e) {
+                        throw new StorageTransactionLogicException(e);
+                    }
+                });
                 return new ImportUserResponse(false, userInfo);
-            } catch (DuplicateUserIdException e) {
-                // we retry with a new userId
-            } catch (DuplicateEmailException e) {
-                if(epStorage instanceof BulkImportStorage){
-                    throw e;
+            } catch (StorageTransactionLogicException e) {
+                if (e.actualException instanceof DuplicateUserIdException) {
+                    // we retry with a new userId
+                    continue;
+                } else if (e.actualException instanceof TenantOrAppNotFoundException) {
+                    throw (TenantOrAppNotFoundException) e.actualException;
+                } else if (!(e.actualException instanceof DuplicateEmailException)) {
+                    throw new StorageQueryException(e.actualException);
+                }
+                // DuplicateEmailException: an email-password user with this email already exists in the tenant.
+                if (epStorage instanceof BulkImportStorage) {
+                    throw (DuplicateEmailException) e.actualException;
                 }
                 AuthRecipeUserInfo[] allUsers = epStorage.listPrimaryUsersByEmail(tenantIdentifier, email);
                 AuthRecipeUserInfo userInfoToBeUpdated = null;
@@ -257,10 +309,13 @@ public class EmailPassword {
                     });
                     return new ImportUserResponse(true, userInfoToBeUpdated);
                 }
+                // No matching user to update (e.g. the duplicate is on another tenant): retry the create loop,
+                // matching the original behaviour.
             }
         }
     }
 
+    @UnauditedTransaction(justification = "Legacy unaudited transaction (PLAN-012 backlog); pending conversion to startAuditedTransaction or read-only exemption.")
     public static void createMultipleUsersWithPasswordHash(Storage storage,
                                                            List<EmailPasswordImportUser> usersToImport)
             throws StorageQueryException, TenantOrAppNotFoundException, StorageTransactionLogicException {
@@ -347,6 +402,11 @@ public class EmailPassword {
             throw new WrongCredentialsException();
         }
 
+        AuditLog.emit(main, storage, tenantIdentifier, new AuditLogEvent(
+                tenantIdentifier.getAppId(), tenantIdentifier.getTenantId(),
+                lM.getSupertokensUserId(), user.getSupertokensUserId(),
+                "emailpassword_sign_in", "success", "email", email,
+                System.currentTimeMillis(), null));
         return user;
     }
 
@@ -467,6 +527,7 @@ public class EmailPassword {
     }
 
     @Deprecated
+    @UnauditedTransaction(justification = "Legacy unaudited transaction (PLAN-012 backlog); pending conversion to startAuditedTransaction or read-only exemption.")
     public static String resetPassword(TenantIdentifier tenantIdentifier, Storage storage, Main main, String token,
                                        String password)
             throws ResetPasswordInvalidTokenException, NoSuchAlgorithmException, StorageQueryException,
@@ -550,6 +611,7 @@ public class EmailPassword {
         }
     }
 
+    @UnauditedTransaction(justification = "Legacy unaudited transaction (PLAN-012 backlog); pending conversion to startAuditedTransaction or read-only exemption.")
     public static ConsumeResetPasswordTokenResult consumeResetPasswordToken(
             TenantIdentifier tenantIdentifier, Storage storage, String token)
             throws ResetPasswordInvalidTokenException, NoSuchAlgorithmException, StorageQueryException,
@@ -599,8 +661,11 @@ public class EmailPassword {
                 if (matchedToken.email == null) {
                     // this is possible if the token was generated before migration, and then consumed
                     // after migration
-                    AuthRecipeUserInfo user = AuthRecipe.getUserById(tenantIdentifier.toAppIdentifier(), storage,
-                            userId);
+                    // Read on the transaction's own connection: the surrounding startTransaction still holds a
+                    // connection from this pool, so borrowing a second one here is the nested same-pool acquisition
+                    // (pool-exhaustion) pattern the connection guard flags.
+                    AuthRecipeUserInfo user = AuthRecipe.getUserById_Transaction(tenantIdentifier.toAppIdentifier(),
+                            con, storage, userId);
                     if (user == null) {
                         throw new StorageTransactionLogicException(new ResetPasswordInvalidTokenException());
                     }
@@ -638,6 +703,7 @@ public class EmailPassword {
         }
     }
 
+    @UnauditedTransaction(justification = "Legacy unaudited transaction (PLAN-012 backlog); pending conversion to startAuditedTransaction or read-only exemption.")
     public static void updateUsersEmailOrPassword(AppIdentifier appIdentifier, Storage storage, Main main,
                                                   @Nonnull String userId, @Nullable String email,
                                                   @Nullable String password)
@@ -646,9 +712,18 @@ public class EmailPassword {
             EmailChangeNotAllowedException {
         EmailPasswordSQLStorage epStorage = StorageUtils.getEmailPasswordStorage(storage);
         AuthRecipeSQLStorage authRecipeStorage = StorageUtils.getAuthRecipeStorage(storage);
+        UserLockingStorage lockingStorage = (UserLockingStorage) storage;
         try {
             epStorage.startTransaction(transaction -> {
                 try {
+                    // Acquire lock on the user to prevent race conditions during email/password update
+                    LockedUser lockedUser;
+                    try {
+                        lockedUser = lockingStorage.lockUser(appIdentifier, transaction, userId);
+                    } catch (UserNotFoundForLockingException e) {
+                        throw new StorageTransactionLogicException(new UnknownUserIdException());
+                    }
+
                     AuthRecipeUserInfo user = authRecipeStorage.getPrimaryUserById_Transaction(appIdentifier,
                             transaction, userId);
 
@@ -667,30 +742,9 @@ public class EmailPassword {
                     }
 
                     if (email != null) {
-                        if (user.isPrimaryUser) {
-                            for (String tenantId : user.tenantIds) {
-                                AuthRecipeUserInfo[] existingUsersWithNewEmail =
-                                        authRecipeStorage.listPrimaryUsersByEmail_Transaction(
-                                                appIdentifier, transaction,
-                                                email);
-
-                                for (AuthRecipeUserInfo userWithSameEmail : existingUsersWithNewEmail) {
-                                    if (!userWithSameEmail.tenantIds.contains(tenantId)) {
-                                        continue;
-                                    }
-                                    if (userWithSameEmail.isPrimaryUser && !userWithSameEmail.getSupertokensUserId()
-                                            .equals(user.getSupertokensUserId())) {
-                                        throw new StorageTransactionLogicException(
-                                                new EmailChangeNotAllowedException());
-                                    }
-                                }
-                            }
-                        }
-
                         try {
-                            epStorage.updateUsersEmail_Transaction(appIdentifier, transaction,
-                                    userId, email);
-                        } catch (DuplicateEmailException e) {
+                            epStorage.updateUsersEmail_Transaction(appIdentifier, transaction, userId, email);
+                        } catch (DuplicateEmailException | EmailChangeNotAllowedException | UnknownUserIdException e) {
                             throw new StorageTransactionLogicException(e);
                         }
                     }

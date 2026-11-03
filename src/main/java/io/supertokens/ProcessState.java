@@ -95,10 +95,34 @@ public class ProcessState extends ResourceDistributor.SingletonResource {
         INIT, INIT_FAILURE, STARTED, SHUTTING_DOWN, STOPPED, RETRYING_ACCESS_TOKEN_JWT_VERIFICATION,
         CRON_TASK_ERROR_LOGGING, WAITING_TO_INIT_STORAGE_MODULE, GET_SESSION_NEW_TOKENS, DEADLOCK_FOUND,
         CREATING_NEW_TABLE, SENDING_TELEMETRY, SENT_TELEMETRY, UPDATING_ACCESS_TOKEN_SIGNING_KEYS,
+        // StorageLayer.initStoragesInParallel gave up waiting for one or more storages and let boot continue
+        // without them (they keep initialising in the background)
+        STORAGE_INIT_TIMED_OUT,
         PASSWORD_HASH_BCRYPT, PASSWORD_HASH_ARGON, PASSWORD_VERIFY_BCRYPT, PASSWORD_VERIFY_ARGON,
         PASSWORD_VERIFY_FIREBASE_SCRYPT, ADDING_REMOTE_ADDRESS_FILTER, LICENSE_KEY_CHECK_NETWORK_CALL,
         INVALID_LICENSE_KEY, SERVER_ERROR_DURING_LICENSE_KEY_CHECK_FAIL, LOADING_ALL_TENANT_CONFIG,
-        LOADING_ALL_TENANT_STORAGE, TENANTS_CHANGED_DURING_REFRESH_FROM_DB
+        LOADING_ALL_TENANT_STORAGE, TENANTS_CHANGED_DURING_REFRESH_FROM_DB,
+        // Storage.verifySchema() found missing tables/columns for a storage (base or tenant). The core
+        // keeps running; only queries touching the missing schema fail, with a schema-mismatch hint.
+        SCHEMA_MISMATCH,
+        BULK_IMPORT_COMPLETE,
+        BULK_IMPORT_SKIPPED_EMPTY_QUEUE,
+        BACKFILL_COMPLETE,
+        // CDI >= 5.6 refresh-time rotation (PLAN-002): a grace-window re-rotation was served, and a
+        // refresh-token reuse was detected and the session revoked, respectively.
+        REFRESH_TOKEN_GRACE_PERIOD_HIT,
+        REFRESH_TOKEN_REUSE_DETECTED,
+        APPROXIMATE_USER_COUNT_REFRESH_COMPLETED,
+        APPROXIMATE_USER_COUNT_REFRESH_FAILED,
+        // Shadow audit at anchor refresh (PLAN-010 unit 3): the anchor+fold projection matched the fresh
+        // exact count, differed from it (a detected ledger/interpreter bug — logged, never served), or the
+        // audit itself could not run (best-effort — never disturbs serving or the refresh), respectively.
+        APPROXIMATE_USER_COUNT_SHADOW_AUDIT_MATCHED,
+        APPROXIMATE_USER_COUNT_SHADOW_AUDIT_DISCREPANCY,
+        APPROXIMATE_USER_COUNT_SHADOW_AUDIT_FAILED,
+        // A request was rejected with 429 by the per-CUD in-flight concurrency cap (the pool was saturated and
+        // the connection URI domain was over its max_concurrent_requests_per_cud). Testing-only signal.
+        CONCURRENT_REQUEST_LIMIT_HIT
     }
 
     public static class EventAndException {

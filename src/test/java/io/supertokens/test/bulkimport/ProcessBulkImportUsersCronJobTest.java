@@ -27,10 +27,12 @@ import io.supertokens.bulkimport.BulkImport;
 import io.supertokens.cronjobs.CronTaskTest;
 import io.supertokens.cronjobs.Cronjobs;
 import io.supertokens.cronjobs.bulkimport.ProcessBulkImportUsers;
+import io.supertokens.emailpassword.EmailPassword;
 import io.supertokens.featureflag.EE_FEATURES;
 import io.supertokens.featureflag.FeatureFlagTestContent;
 import io.supertokens.pluginInterface.STORAGE_TYPE;
 import io.supertokens.pluginInterface.Storage;
+import io.supertokens.pluginInterface.authRecipe.AuthRecipeUserInfo;
 import io.supertokens.pluginInterface.bulkimport.BulkImportStorage.BULK_IMPORT_USER_STATUS;
 import io.supertokens.pluginInterface.bulkimport.BulkImportUser;
 import io.supertokens.pluginInterface.bulkimport.sqlStorage.BulkImportSQLStorage;
@@ -116,6 +118,45 @@ public class ProcessBulkImportUsersCronJobTest {
         BulkImportTestUtils.assertBulkImportUserAndAuthRecipeUserAreEqual(main, appIdentifier, publicTenant, storage,
                 bulkImportUser,
                 container.users[0]);
+
+        process.kill();
+        assertNotNull(process.checkOrWaitForEvent(ProcessState.PROCESS_STATE.STOPPED));
+    }
+
+    @Test
+    public void shouldFailBulkImportUserWhenExternalUserIdMappingAlreadyExists() throws Exception {
+        TestingProcess process = startCronProcess();
+        if (process == null) {
+            return;
+        }
+
+        Main main = process.getProcess();
+        BulkImportSQLStorage storage = (BulkImportSQLStorage) StorageLayer.getStorage(main);
+        AppIdentifier appIdentifier = new AppIdentifier(null, null);
+        AuthRecipeUserInfo existingUser = EmailPassword.signUp(main, "existing@example.com", "password");
+        String externalUserId = "existing-external-user-id";
+        UserIdMapping.createUserIdMapping(main, existingUser.getSupertokensUserId(), externalUserId, null, false);
+
+        String importedUserId = io.supertokens.utils.Utils.getUUID();
+        BulkImportUser.LoginMethod thirdPartyLoginMethod = new BulkImportUser.LoginMethod(List.of("public"),
+                "thirdparty", true, true, System.currentTimeMillis(), "imported@example.com", null, null, null,
+                "google", "third-party-user-id", null, importedUserId);
+        BulkImportUser userToImport = new BulkImportUser(importedUserId, externalUserId, null, null, null,
+                List.of(thirdPartyLoginMethod));
+        BulkImport.addUsers(appIdentifier, storage, List.of(userToImport));
+
+        waitForProcessingWithTimeout(appIdentifier, storage, 30);
+
+        List<BulkImportUser> usersAfterProcessing = storage.getBulkImportUsers(appIdentifier, 100, null,
+                null, null);
+        assertEquals(1, usersAfterProcessing.size());
+        assertEquals(BULK_IMPORT_USER_STATUS.FAILED, usersAfterProcessing.get(0).status);
+        assertEquals("E031: A user with externalId existing-external-user-id already exists",
+                usersAfterProcessing.get(0).errorMessage);
+
+        UserPaginationContainer users = AuthRecipe.getUsers(main, 100, "ASC", null, null, null);
+        assertEquals(1, users.users.length);
+        assertEquals(existingUser.getSupertokensUserId(), users.users[0].getSupertokensUserId());
 
         process.kill();
         assertNotNull(process.checkOrWaitForEvent(ProcessState.PROCESS_STATE.STOPPED));
@@ -778,6 +819,9 @@ public class ProcessBulkImportUsersCronJobTest {
 
         UserPaginationContainer container = AuthRecipe.getUsers(main, 100, "ASC", null, null, null);
         assertEquals(0, container.users.length);
+
+        process.kill();
+        assertNotNull(process.checkOrWaitForEvent(ProcessState.PROCESS_STATE.STOPPED));
     }
 
 
@@ -822,6 +866,9 @@ public class ProcessBulkImportUsersCronJobTest {
 
         UserPaginationContainer container = AuthRecipe.getUsers(main, 100, "ASC", null, null, null);
         assertEquals(0, container.users.length);
+
+        process.kill();
+        assertNotNull(process.checkOrWaitForEvent(ProcessState.PROCESS_STATE.STOPPED));
     }
 
     @Test
@@ -874,6 +921,9 @@ public class ProcessBulkImportUsersCronJobTest {
         UserPaginationContainer container = AuthRecipe.getUsers(main, 100, "ASC", null, null, null);
         assertEquals(99, container.users.length);
         assertEquals(1, numberOfFailed);
+
+        process.kill();
+        assertNotNull(process.checkOrWaitForEvent(ProcessState.PROCESS_STATE.STOPPED));
     }
 
 
@@ -907,6 +957,9 @@ public class ProcessBulkImportUsersCronJobTest {
         assertEquals(
                 "[Invalid tenantId: t1 for a user role., Invalid tenantId: t1 for a user role., Invalid tenantId: t1 for emailpassword recipe., Invalid tenantId: t1 for thirdparty recipe., Invalid tenantId: t1 for passwordless recipe.]",
                 usersAfterProcessing.get(0).errorMessage);
+
+        process.kill();
+        assertNotNull(process.checkOrWaitForEvent(ProcessState.PROCESS_STATE.STOPPED));
     }
 
     @Test
@@ -940,6 +993,31 @@ public class ProcessBulkImportUsersCronJobTest {
         assertEquals(
                 "[All tenants for a user must share the same database for emailpassword recipe., All tenants for a user must share the same database for thirdparty recipe., All tenants for a user must share the same database for passwordless recipe.]",
                 usersAfterProcessing.get(0).errorMessage);
+
+        process.kill();
+        assertNotNull(process.checkOrWaitForEvent(ProcessState.PROCESS_STATE.STOPPED));
+    }
+
+    @Test
+    public void shouldSkipProcessingWhenBulkImportQueueIsEmpty() throws Exception {
+        TestingProcess process = startCronProcess();
+        if (process == null) {
+            return;
+        }
+
+        Main main = process.getProcess();
+
+        // no users are uploaded; the cron must take the early-return path and never start workers
+        ProcessState.EventAndException skipEvent = process.checkOrWaitForEvent(
+                ProcessState.PROCESS_STATE.BULK_IMPORT_SKIPPED_EMPTY_QUEUE, 30000);
+        assertNotNull("expected the cron to fire BULK_IMPORT_SKIPPED_EMPTY_QUEUE on an empty queue", skipEvent);
+
+        // the skip happens before any batch is processed, so completion must never be reported
+        assertNull(ProcessState.getInstance(main).getLastEventByName(
+                ProcessState.PROCESS_STATE.BULK_IMPORT_COMPLETE));
+
+        process.kill();
+        assertNotNull(process.checkOrWaitForEvent(ProcessState.PROCESS_STATE.STOPPED));
     }
 
     private TestingProcess startCronProcess() throws InterruptedException, TenantOrAppNotFoundException {

@@ -37,8 +37,10 @@ import org.jetbrains.annotations.TestOnly;
 
 import java.security.NoSuchAlgorithmException;
 import java.security.spec.InvalidKeySpecException;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import io.supertokens.auditlog.UnauditedTransaction;
 
 public class RefreshTokenKey extends ResourceDistributor.SingletonResource {
 
@@ -51,6 +53,10 @@ public class RefreshTokenKey extends ResourceDistributor.SingletonResource {
             TenantOrAppNotFoundException {
         this.main = main;
         this.appIdentifier = appIdentifier;
+        if (StorageLayer.isStorageStillInitialising(main, appIdentifier)) {
+            // querying a storage that is still initialising would wait for it; getKey() loads the key on first use
+            return;
+        }
         try {
             this.getKey();
         } catch (StorageQueryException | StorageTransactionLogicException e) {
@@ -76,34 +82,27 @@ public class RefreshTokenKey extends ResourceDistributor.SingletonResource {
 
     public static void loadForAllTenants(Main main, List<AppIdentifier> apps,
                                          List<TenantIdentifier> tenantsThatChanged) {
-        try {
-            main.getResourceDistributor().withResourceDistributorLock(() -> {
-                Map<ResourceDistributor.KeyClass, ResourceDistributor.SingletonResource> existingResources =
-                        main.getResourceDistributor()
-                                .getAllResourcesWithResourceKey(RESOURCE_KEY);
-                main.getResourceDistributor().clearAllResourcesWithResourceKey(RESOURCE_KEY);
-                for (AppIdentifier app : apps) {
-                    ResourceDistributor.SingletonResource resource = existingResources.get(
-                            new ResourceDistributor.KeyClass(app, RESOURCE_KEY));
-                    if (resource != null && !tenantsThatChanged.contains(app.getAsPublicTenantIdentifier())) {
-                        main.getResourceDistributor().setResource(app, RESOURCE_KEY,
-                                resource);
-                    } else {
-                        try {
-                            main.getResourceDistributor()
-                                    .setResource(app, RESOURCE_KEY,
-                                            new RefreshTokenKey(app, main));
-                        } catch (TenantOrAppNotFoundException e) {
-                            Logging.error(main, app.getAsPublicTenantIdentifier(), e.getMessage(), false);
-                            // continue loading other resources
-                        }
-                    }
+        Map<ResourceDistributor.KeyClass, ResourceDistributor.SingletonResource> existingResources =
+                main.getResourceDistributor()
+                        .getAllResourcesWithResourceKey(RESOURCE_KEY);
+        Map<ResourceDistributor.KeyClass, ResourceDistributor.SingletonResource> newResources =
+                new HashMap<>();
+        for (AppIdentifier app : apps) {
+            ResourceDistributor.SingletonResource resource = existingResources.get(
+                    new ResourceDistributor.KeyClass(app, RESOURCE_KEY));
+            if (resource != null && !tenantsThatChanged.contains(app.getAsPublicTenantIdentifier())) {
+                newResources.put(new ResourceDistributor.KeyClass(app, RESOURCE_KEY), resource);
+            } else {
+                try {
+                    newResources.put(new ResourceDistributor.KeyClass(app, RESOURCE_KEY),
+                            new RefreshTokenKey(app, main));
+                } catch (TenantOrAppNotFoundException e) {
+                    Logging.error(main, app.getAsPublicTenantIdentifier(), e.getMessage(), false);
+                    // continue loading other resources
                 }
-                return null;
-            });
-        } catch (ResourceDistributor.FuncException e) {
-            throw new IllegalStateException("should never happen", e);
+            }
         }
+        main.getResourceDistributor().replaceResourcesWithResourceKey(RESOURCE_KEY, newResources);
     }
 
     public String getKey() throws StorageQueryException, StorageTransactionLogicException,
@@ -115,6 +114,7 @@ public class RefreshTokenKey extends ResourceDistributor.SingletonResource {
         return this.key;
     }
 
+    @UnauditedTransaction(justification = "System signing-key or certificate housekeeping; no user-facing state change to audit.")
     private String maybeGenerateNewKeyAndUpdateInDb()
             throws StorageQueryException, StorageTransactionLogicException, TenantOrAppNotFoundException {
         SessionStorage storage = (SessionStorage) StorageLayer.getStorage(

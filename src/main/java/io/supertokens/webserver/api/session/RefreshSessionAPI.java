@@ -18,8 +18,11 @@ package io.supertokens.webserver.api.session;
 
 import com.google.gson.JsonObject;
 import io.supertokens.ActiveUsers;
+import io.supertokens.pluginInterface.auditlog.ActivityEventType;
+import io.supertokens.config.Config;
 import io.supertokens.Main;
 import io.supertokens.exceptions.AccessTokenPayloadError;
+import io.supertokens.exceptions.AccessTokenValidityOutOfRangeException;
 import io.supertokens.exceptions.TokenTheftDetectedException;
 import io.supertokens.exceptions.UnauthorisedException;
 import io.supertokens.jwt.exceptions.UnsupportedJWTSigningAlgorithmException;
@@ -72,6 +75,11 @@ public class RefreshSessionAPI extends WebserverAPI {
         Boolean useDynamicSigningKey = version.greaterThanOrEqualTo(SemVer.v3_0)
                 ? InputParser.parseBooleanOrThrowError(input, "useDynamicSigningKey", version.lesserThan(SemVer.v5_0))
                 : null;
+        // Optional per-mint access token validity override (ms), CDI >= 5.6 only (PLAN-002 decision 11).
+        // Shorten-only; validated against the configured access_token_validity in Session.refreshSession.
+        Long accessTokenValidity = version.greaterThanOrEqualTo(SemVer.v5_6)
+                ? InputParser.parseLongOrThrowError(input, "accessTokenValidity", true)
+                : null;
 
         assert enableAntiCsrf != null;
         assert refreshToken != null;
@@ -90,19 +98,37 @@ public class RefreshSessionAPI extends WebserverAPI {
             SessionInformationHolder sessionInfo = Session.refreshSession(appIdentifier, main,
                     refreshToken, antiCsrfToken,
                     enableAntiCsrf, accessTokenVersion,
-                    useDynamicSigningKey == null ? null : Boolean.FALSE.equals(useDynamicSigningKey));
+                    useDynamicSigningKey == null ? null : Boolean.FALSE.equals(useDynamicSigningKey), version,
+                    accessTokenValidity);
             TenantIdentifier tenantIdentifier = new TenantIdentifier(appIdentifier.getConnectionUriDomain(),
                     appIdentifier.getAppId(), sessionInfo.session.tenantId);
             Storage storage = StorageLayer.getStorage(tenantIdentifier, main);
 
-            if (storage.getType() == STORAGE_TYPE.SQL) {
+            // Skip the userid_mapping lookup and the activity-log write when the same session user_id was
+            // marked active recently. With default 1h access tokens and diverse user_ids this gate rarely
+            // fires — refreshes are typically further apart than the throttle window. Its real value is
+            // capping the blast radius of refresh loops, burst patterns (e.g. many tabs refreshing at once),
+            // and load tests that concentrate on a small user set; it is not expected to move the needle on
+            // steady-state per-request latency. This short-circuit is itself part of the throttle, so it is
+            // bypassed (every refresh records) when activity_log_throttle_enabled is off.
+            boolean throttleEnabled = Config.getConfig(tenantIdentifier, main).getActivityLogThrottleEnabled();
+            if (storage.getType() == STORAGE_TYPE.SQL
+                    && (!throttleEnabled
+                            || !ActiveUsers.wasRecentlyActive(appIdentifier, sessionInfo.session.userId))) {
                 try {
                     UserIdMapping userIdMapping = io.supertokens.useridmapping.UserIdMapping.getUserIdMapping(
                             appIdentifier, storage, sessionInfo.session.userId, UserIdType.ANY);
                     if (userIdMapping != null) {
-                        ActiveUsers.updateLastActive(appIdentifier, main, userIdMapping.superTokensUserId);
+                        ActiveUsers.updateLastActive(tenantIdentifier, main, userIdMapping.superTokensUserId,
+                                ActivityEventType.TOKEN_REFRESH);
                     } else {
-                        ActiveUsers.updateLastActive(appIdentifier, main, sessionInfo.session.userId);
+                        ActiveUsers.updateLastActive(tenantIdentifier, main, sessionInfo.session.userId,
+                                ActivityEventType.TOKEN_REFRESH);
+                    }
+                    if (throttleEnabled) {
+                        // Mark by the session's user_id so the next refresh can short-circuit the mapping
+                        // lookup, not just the write. Meaningful only while throttling is on.
+                        ActiveUsers.markRecentlyActive(appIdentifier, sessionInfo.session.userId);
                     }
                 } catch (StorageQueryException ignored) {
                 }
@@ -125,12 +151,19 @@ public class RefreshSessionAPI extends WebserverAPI {
         } catch (StorageQueryException | StorageTransactionLogicException | TenantOrAppNotFoundException |
                  UnsupportedJWTSigningAlgorithmException e) {
             throw new ServletException(e);
+        } catch (AccessTokenValidityOutOfRangeException e) {
+            throw new ServletException(new BadRequestException(e.getMessage()));
         } catch (AccessTokenPayloadError | UnauthorisedException e) {
             Logging.debug(main, tenantIdentifierForLogging,
                     Utils.exceptionStacktraceToString(e));
             JsonObject reply = new JsonObject();
             reply.addProperty("status", "UNAUTHORISED");
             reply.addProperty("message", e.getMessage());
+            // CDI >= 5.6: a recent refresh-token reuse reported as UNAUTHORISED carries its subtype so
+            // consumers can route recent-reuse vs ordinary unauthorised. Null on every other unauthorised.
+            if (e instanceof UnauthorisedException && ((UnauthorisedException) e).reuseSubtype != null) {
+                reply.addProperty("recentTokenReuseSubtype", ((UnauthorisedException) e).reuseSubtype.name());
+            }
             super.sendJsonResponse(200, reply, resp);
         } catch (TokenTheftDetectedException e) {
             Logging.debug(main, tenantIdentifierForLogging,
@@ -143,6 +176,11 @@ public class RefreshSessionAPI extends WebserverAPI {
             session.addProperty("userId", e.primaryUserId);
             session.addProperty("recipeUserId", e.recipeUserId);
             reply.add("session", session);
+            // CDI >= 5.6 refresh-time detection carries the reuse subtype (RECENT_PREV / ORPHANED_BRANCH /
+            // STALE_LINEAGE); null on legacy (CDI <= 5.4) theft so those responses stay byte-identical.
+            if (e.reuseSubtype != null) {
+                reply.addProperty("recentTokenReuseSubtype", e.reuseSubtype.name());
+            }
 
             super.sendJsonResponse(200, reply, resp);
         }

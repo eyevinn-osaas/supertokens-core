@@ -16,10 +16,24 @@
 
 package io.supertokens.inmemorydb.config;
 
+import io.supertokens.pluginInterface.MigrationMode;
+import org.jetbrains.annotations.TestOnly;
+
 import java.util.HashSet;
 import java.util.Set;
 
 public class SQLiteConfig {
+
+    private static MigrationMode migrationMode = MigrationMode.MIGRATED;
+
+    @TestOnly
+    public static void setMigrationModeForTesting(MigrationMode mode) {
+        migrationMode = mode;
+    }
+
+    public MigrationMode getMigrationMode() {
+        return migrationMode;
+    }
 
     public static Set<String> getValidFields() {
         return new HashSet<>();
@@ -177,6 +191,10 @@ public class SQLiteConfig {
         return "oauth_m2m_tokens";
     }
 
+    public String getOAuthM2MTokenStatsTable() {
+        return "oauth_m2m_token_stats";
+    }
+
     public String getOAuthSessionsTable() {
         return "oauth_sessions";
     }
@@ -200,4 +218,22 @@ public class SQLiteConfig {
     public String getSAMLRelayStateTable() { return "saml_relay_state"; }
 
     public String getSAMLClaimsTable() { return "saml_claims"; }
+
+    public String getSAMLConsumedAssertionsTable() { return "saml_consumed_assertions"; }
+
+    public String getRecipeUserAccountInfosTable() {
+        return "recipe_user_account_infos";
+    }
+
+    public String getRecipeUserTenantsTable() {
+        return "recipe_user_tenants";
+    }
+
+    public String getPrimaryUserTenantsTable() {
+        return "primary_user_tenants";
+    }
+
+    public String getActivityLogTable() {
+        return "activity_log";
+    }
 }

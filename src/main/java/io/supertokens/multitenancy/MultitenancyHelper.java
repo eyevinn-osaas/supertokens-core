@@ -52,22 +52,22 @@ public class MultitenancyHelper extends ResourceDistributor.SingletonResource {
 
     public static final String RESOURCE_KEY = "io.supertokens.multitenancy.Multitenancy";
     private Main main;
-    private TenantConfig[] tenantConfigs;
+    private volatile TenantConfig[] tenantConfigs;
 
     // when the core has `supertokens_saas_load_only_cud` set, the tenantConfigs array will be filtered
     // based on the config value. However, we need to keep all the list of CUDs from the db to be able
     // to check if the CUD is present in the DB or not, while processing the requests.
-    private final Set<String> dangerous_allCUDsFromDb = new HashSet<>();
+    private volatile Set<String> dangerous_allCUDsFromDb = new HashSet<>();
 
     private MultitenancyHelper(Main main) throws StorageQueryException {
         this.main = main;
         TenantConfig[] allTenantsFromDb = getAllTenantsFromDb();
         this.tenantConfigs = this.getFilteredTenantConfigs(allTenantsFromDb);
-        this.dangerous_allCUDsFromDb.clear();
-
+        Set<String> cuds = new HashSet<>();
         for (TenantConfig config : allTenantsFromDb) {
-            this.dangerous_allCUDsFromDb.add(config.tenantIdentifier.getConnectionUriDomain());
+            cuds.add(config.tenantIdentifier.getConnectionUriDomain());
         }
+        this.dangerous_allCUDsFromDb = cuds;
     }
 
     public static MultitenancyHelper getInstance(Main main) {
@@ -150,10 +150,11 @@ public class MultitenancyHelper extends ResourceDistributor.SingletonResource {
                     boolean sameNumberOfTenants =
                             filteredTenantsFromDb.length == this.tenantConfigs.length;
 
-                    this.dangerous_allCUDsFromDb.clear();
+                    Set<String> cuds = new HashSet<>();
                     for (TenantConfig tenant : tenantsFromDb) {
-                        this.dangerous_allCUDsFromDb.add(tenant.tenantIdentifier.getConnectionUriDomain());
+                        cuds.add(tenant.tenantIdentifier.getConnectionUriDomain());
                     }
+                    this.dangerous_allCUDsFromDb = cuds;
                     this.tenantConfigs = filteredTenantsFromDb;
                     if (tenantsThatChanged.size() == 0 && sameNumberOfTenants) {
                         return tenantsThatChanged;
@@ -183,6 +184,132 @@ public class MultitenancyHelper extends ResourceDistributor.SingletonResource {
         }
     }
 
+    /**
+     * Fast path for addNewOrUpdateAppOrTenant: instead of doing the full 2 × getNormalisedConfigsForAllTenants
+     * diff, it only normalizes configs for the affected tenants (the changed tenant + its children
+     * in the inheritance hierarchy). Detects actual changes to avoid replacing resources when
+     * configs haven't changed (preserving object identity for tests that check assertEquals).
+     */
+    public List<TenantIdentifier> refreshAfterKnownTenantChange(TenantIdentifier changedTenant) {
+        try {
+            return main.getResourceDistributor().withResourceDistributorLock(() -> {
+                try {
+                    TenantConfig[] tenantsFromDb = getAllTenantsFromDb();
+                    TenantConfig[] filteredTenantsFromDb = this.getFilteredTenantConfigs(tenantsFromDb);
+
+                    boolean sameNumberOfTenants =
+                            filteredTenantsFromDb.length == this.tenantConfigs.length;
+
+                    // Build set of existing tenant IDs for new-tenant detection
+                    Set<TenantIdentifier> existingTenantIds = new HashSet<>();
+                    for (TenantConfig tc : this.tenantConfigs) {
+                        existingTenantIds.add(tc.tenantIdentifier);
+                    }
+
+                    // Compute the affected set: the changed tenant + children that inherit from it
+                    List<TenantIdentifier> affectedTenants = new ArrayList<>();
+                    affectedTenants.add(changedTenant);
+
+                    // If the changed tenant is a parent (app or CUD level), child tenants
+                    // inherit its config and may also need reloading
+                    if (changedTenant.getTenantId().equals(TenantIdentifier.DEFAULT_TENANT_ID)) {
+                        for (TenantConfig tc : filteredTenantsFromDb) {
+                            TenantIdentifier ti = tc.tenantIdentifier;
+                            if (ti.equals(changedTenant)) continue;
+
+                            boolean isChild;
+                            if (changedTenant.getAppId().equals(TenantIdentifier.DEFAULT_APP_ID)) {
+                                // CUD level parent: affects all tenants in this CUD
+                                isChild = ti.getConnectionUriDomain()
+                                        .equals(changedTenant.getConnectionUriDomain());
+                            } else {
+                                // App level parent: affects all tenants in this app
+                                isChild = ti.getConnectionUriDomain()
+                                        .equals(changedTenant.getConnectionUriDomain())
+                                        && ti.getAppId().equals(changedTenant.getAppId());
+                            }
+                            if (isChild) {
+                                affectedTenants.add(ti);
+                            }
+                        }
+                    }
+
+                    // For each affected tenant that already exists, check if its normalized
+                    // config actually changed compared to the in-memory state.
+                    // New tenants are NOT added to tenantsThatChanged — they are handled by
+                    // the full loadConfig + loadStorageLayer calls below (which create resources
+                    // for all tenants in tenantConfigs). This matches the behavior of the
+                    // original refreshTenantsInCoreBasedOnChangesInCoreConfigOrIfTenantListChanged.
+                    JsonObject baseConfig = Config.getBaseConfigAsJsonObject(main);
+                    List<TenantIdentifier> tenantsThatChanged = new ArrayList<>();
+                    for (TenantIdentifier affected : affectedTenants) {
+                        if (existingTenantIds.contains(affected)) {
+                            JsonObject normFromDb = Config.getNormalisedConfigForTenant(
+                                    affected, filteredTenantsFromDb, baseConfig);
+                            JsonObject normFromMemory = Config.getNormalisedConfigForTenant(
+                                    affected, this.tenantConfigs, baseConfig);
+                            if (!normFromDb.equals(normFromMemory)) {
+                                tenantsThatChanged.add(affected);
+                            }
+                        }
+                        // New tenants (not in existingTenantIds) are skipped here;
+                        // sameNumberOfTenants will be false, preventing early return.
+                    }
+
+                    this.dangerous_allCUDsFromDb.clear();
+                    for (TenantConfig tenant : tenantsFromDb) {
+                        this.dangerous_allCUDsFromDb.add(tenant.tenantIdentifier.getConnectionUriDomain());
+                    }
+                    this.tenantConfigs = filteredTenantsFromDb;
+
+                    if (tenantsThatChanged.isEmpty() && sameNumberOfTenants) {
+                        return tenantsThatChanged;
+                    }
+
+                    ProcessState.getInstance(main)
+                            .addState(ProcessState.PROCESS_STATE.TENANTS_CHANGED_DURING_REFRESH_FROM_DB, null);
+
+                    // Use the same full loading as the original code path.
+                    // Config + storage are loaded here; the finally block only needs
+                    // to load feature flags, signing keys, and refresh cronjobs.
+                    loadConfig(tenantsThatChanged);
+                    loadStorageLayer();
+
+                    return tenantsThatChanged;
+                } catch (Exception e) {
+                    Logging.error(main, TenantIdentifier.BASE_TENANT, e.getMessage(), false, e);
+                    return new ArrayList<>();
+                }
+            });
+        } catch (ResourceDistributor.FuncException e) {
+            throw new IllegalStateException(e);
+        }
+    }
+
+    /**
+     * Called from addNewOrUpdateAppOrTenant's finally block (when forceReloadResources=true).
+     * Config + storage are already loaded by refreshAfterKnownTenantChange, so this only
+     * loads feature flags, signing keys, and refreshes cronjobs for the changed tenants.
+     */
+    public void incrementalReloadResources(List<TenantIdentifier> tenantsThatChanged) {
+        try {
+            main.getResourceDistributor().withResourceDistributorLock(() -> {
+                try {
+                    // Config and storage are already loaded by refreshAfterKnownTenantChange.
+                    // Only load the remaining resources here.
+                    loadFeatureFlag(tenantsThatChanged);
+                    loadSigningKeys(tenantsThatChanged);
+                    refreshCronjobs();
+                } catch (Exception e) {
+                    Logging.error(main, TenantIdentifier.BASE_TENANT, e.getMessage(), false, e);
+                }
+                return null;
+            });
+        } catch (ResourceDistributor.FuncException e) {
+            throw new IllegalStateException(e);
+        }
+    }
+
     public void forceReloadAllResources(List<TenantIdentifier> tenantsThatChanged) {
         try {
             main.getResourceDistributor().withResourceDistributorLock(() -> {
@@ -206,8 +333,18 @@ public class MultitenancyHelper extends ResourceDistributor.SingletonResource {
         Config.loadAllTenantConfig(main, this.tenantConfigs, tenantsThatChanged);
     }
 
+    public void loadConfigIncremental(List<TenantIdentifier> tenantsThatChanged)
+            throws IOException, InvalidConfigException {
+        Config.loadConfigForChangedTenants(main, this.tenantConfigs, tenantsThatChanged);
+    }
+
     public void loadStorageLayer() throws IOException, InvalidConfigException {
         StorageLayer.loadAllTenantStorage(main, this.tenantConfigs);
+    }
+
+    public void loadStorageLayerIncremental(List<TenantIdentifier> tenantsThatChanged)
+            throws IOException, InvalidConfigException {
+        StorageLayer.loadStorageForChangedTenants(main, this.tenantConfigs, tenantsThatChanged);
     }
 
     public void loadFeatureFlag(List<TenantIdentifier> tenantsThatChanged) {
@@ -247,20 +384,14 @@ public class MultitenancyHelper extends ResourceDistributor.SingletonResource {
     }
 
     public TenantConfig[] getAllTenants() {
-        try {
-            return main.getResourceDistributor().withResourceDistributorLockWithReturn(() -> {
-                // Returning a deep copy of the tenantConfigs array so that the functions consuming it
-                // do not modify the original array
-                TenantConfig[] tenantConfigs = new TenantConfig[this.tenantConfigs.length];
-
-                for (int i = 0; i < this.tenantConfigs.length; i++) {
-                    tenantConfigs[i] = new TenantConfig(this.tenantConfigs[i]);
-                }
-                return tenantConfigs;
-            });
-        } catch (ResourceDistributor.FuncException e) {
-            throw new IllegalStateException(e);
+        // Capture the volatile reference first so the loop operates on a stable snapshot,
+        // even if a refresh reassigns tenantConfigs mid-iteration.
+        TenantConfig[] snapshot = this.tenantConfigs;
+        TenantConfig[] result = new TenantConfig[snapshot.length];
+        for (int i = 0; i < snapshot.length; i++) {
+            result[i] = new TenantConfig(snapshot[i]);
         }
+        return result;
     }
 
     private TenantConfig[] getFilteredTenantConfigs(TenantConfig[] inputTenantConfigs) {
@@ -270,11 +401,67 @@ public class MultitenancyHelper extends ResourceDistributor.SingletonResource {
             return inputTenantConfigs;
         }
 
-        return Arrays.stream(inputTenantConfigs)
-                .filter(tenantConfig -> tenantConfig.tenantIdentifier.getConnectionUriDomain().equals(loadOnlyCUD)
-                        || tenantConfig.tenantIdentifier.getConnectionUriDomain()
-                        .equals(TenantIdentifier.DEFAULT_CONNECTION_URI))
-                .toArray(TenantConfig[]::new);
+        List<TenantConfig> droppedTenantConfigs = new ArrayList<>();
+        TenantConfig[] filtered = filterTenantConfigsForLoadOnlyCUD(inputTenantConfigs, loadOnlyCUD,
+                droppedTenantConfigs);
+
+        Set<String> currentlyLoadedCUDs = getCurrentlyLoadedConnectionUriDomains();
+        for (TenantConfig dropped : droppedTenantConfigs) {
+            // Only a CUD that is *currently loaded* (has live resources in the distributor) is worth
+            // shouting about: replaceResourcesWithResourceKey is about to wipe its resources, which would
+            // otherwise surface as a log-free TenantOrAppNotFoundException on every request for that CUD.
+            if (currentlyLoadedCUDs.contains(dropped.tenantIdentifier.getConnectionUriDomain())) {
+                Logging.error(main, dropped.tenantIdentifier,
+                        "supertokens_saas_load_only_cud is set to '" + loadOnlyCUD + "', which excludes the "
+                                + "previously-loaded connectionUriDomain '"
+                                + dropped.tenantIdentifier.getConnectionUriDomain()
+                                + "'. Its resources are being removed and requests for it will fail. Check that "
+                                + "supertokens_saas_load_only_cud matches the stored connectionUriDomain.", true);
+            }
+        }
+
+        return filtered;
+    }
+
+    /**
+     * Filters {@code inputTenantConfigs} down to the CUDs that a core configured with
+     * {@code supertokens_saas_load_only_cud} should load: the default CUD is always kept, and a CUD is
+     * kept when its connectionUriDomain equals {@code loadOnlyCUD}. Both operands are already normalized
+     * on their own write path — the stored connectionUriDomain by the throwing
+     * {@code Utils.normalizeAndValidateConnectionUriDomain} at tenant-create time and {@code loadOnlyCUD}
+     * by the same normalizer on config load ({@code CoreConfig}) — so an exact match is correct for any
+     * CUD created through the API and no comparison-time normalization is needed. Any excluded CUD is
+     * added to {@code droppedTenantConfigs} (when non-null) so the caller can flag a drop of a live CUD,
+     * which is the part of this filter that actually addresses the "present, then silently wiped" symptom.
+     * <p>
+     * Package-private and static (no {@code main}) so it can be unit-tested directly.
+     */
+    static TenantConfig[] filterTenantConfigsForLoadOnlyCUD(TenantConfig[] inputTenantConfigs, String loadOnlyCUD,
+                                                            List<TenantConfig> droppedTenantConfigs) {
+        List<TenantConfig> filtered = new ArrayList<>();
+        for (TenantConfig tenantConfig : inputTenantConfigs) {
+            String connectionUriDomain = tenantConfig.tenantIdentifier.getConnectionUriDomain();
+            if (connectionUriDomain.equals(TenantIdentifier.DEFAULT_CONNECTION_URI)
+                    || connectionUriDomain.equals(loadOnlyCUD)) {
+                filtered.add(tenantConfig);
+            } else if (droppedTenantConfigs != null) {
+                droppedTenantConfigs.add(tenantConfig);
+            }
+        }
+        return filtered.toArray(new TenantConfig[0]);
+    }
+
+    // Built once per refresh, so the drop check above is one set lookup per dropped tenant rather than a scan of
+    // every loaded tenant (this runs under the ResourceDistributor lock).
+    private Set<String> getCurrentlyLoadedConnectionUriDomains() {
+        Set<String> result = new HashSet<>();
+        TenantConfig[] currentlyLoaded = this.tenantConfigs;
+        if (currentlyLoaded != null) {
+            for (TenantConfig tenantConfig : currentlyLoaded) {
+                result.add(tenantConfig.tenantIdentifier.getConnectionUriDomain());
+            }
+        }
+        return result;
     }
 
     public boolean isConnectionUriDomainPresentInDb(String cud) {

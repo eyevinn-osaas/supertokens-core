@@ -18,15 +18,14 @@ package io.supertokens.webserver.api.session;
 
 import com.google.gson.Gson;
 import com.google.gson.JsonObject;
-import io.supertokens.ActiveUsers;
 import io.supertokens.Main;
 import io.supertokens.config.Config;
 import io.supertokens.exceptions.AccessTokenPayloadError;
+import io.supertokens.exceptions.AccessTokenValidityOutOfRangeException;
 import io.supertokens.exceptions.UnauthorisedException;
 import io.supertokens.jwt.exceptions.UnsupportedJWTSigningAlgorithmException;
 import io.supertokens.output.Logging;
 import io.supertokens.pluginInterface.RECIPE_ID;
-import io.supertokens.pluginInterface.STORAGE_TYPE;
 import io.supertokens.pluginInterface.Storage;
 import io.supertokens.pluginInterface.exceptions.StorageQueryException;
 import io.supertokens.pluginInterface.exceptions.StorageTransactionLogicException;
@@ -38,7 +37,6 @@ import io.supertokens.session.Session;
 import io.supertokens.session.accessToken.AccessToken;
 import io.supertokens.session.info.SessionInformationHolder;
 import io.supertokens.storageLayer.StorageLayer;
-import io.supertokens.useridmapping.UserIdType;
 import io.supertokens.utils.SemVer;
 import io.supertokens.utils.Utils;
 import io.supertokens.webserver.InputParser;
@@ -83,6 +81,11 @@ public class SessionAPI extends WebserverAPI {
         assert userDataInJWT != null;
         JsonObject userDataInDatabase = InputParser.parseJsonObjectOrThrowError(input, "userDataInDatabase", false);
         assert userDataInDatabase != null;
+        // Optional per-mint access token validity override (ms), CDI >= 5.6 only (PLAN-002 decision 11).
+        // Shorten-only; validated against the configured access_token_validity in Session.createNewSession.
+        Long accessTokenValidity = version.greaterThanOrEqualTo(SemVer.v5_6)
+                ? InputParser.parseLongOrThrowError(input, "accessTokenValidity", true)
+                : null;
 
         try {
             TenantIdentifier tenantIdentifier = getTenantIdentifier(req);
@@ -103,24 +106,7 @@ public class SessionAPI extends WebserverAPI {
             SessionInformationHolder sessionInfo = Session.createNewSession(
                     tenantIdentifier, storage, main, userId, userDataInJWT,
                     userDataInDatabase, enableAntiCsrf, accessTokenVersion,
-                    useStaticSigningKey);
-
-            if (storage.getType() == STORAGE_TYPE.SQL) {
-                try {
-                    io.supertokens.pluginInterface.useridmapping.UserIdMapping userIdMapping =
-                            io.supertokens.useridmapping.UserIdMapping.getUserIdMapping(
-                                    tenantIdentifier.toAppIdentifier(), storage,
-                                    sessionInfo.session.userId, UserIdType.ANY);
-                    if (userIdMapping != null) {
-                        ActiveUsers.updateLastActive(tenantIdentifier.toAppIdentifier(), main,
-                                userIdMapping.superTokensUserId);
-                    } else {
-                        ActiveUsers.updateLastActive(tenantIdentifier.toAppIdentifier(), main,
-                                sessionInfo.session.userId);
-                    }
-                } catch (StorageQueryException ignored) {
-                }
-            }
+                    useStaticSigningKey, accessTokenValidity);
 
             JsonObject result = sessionInfo.toJsonObject();
 
@@ -141,7 +127,7 @@ public class SessionAPI extends WebserverAPI {
             }
 
             super.sendJsonResponse(200, result, resp);
-        } catch (AccessTokenPayloadError e) {
+        } catch (AccessTokenPayloadError | AccessTokenValidityOutOfRangeException e) {
             throw new ServletException(new BadRequestException(e.getMessage()));
         } catch (NoSuchAlgorithmException | StorageQueryException | InvalidKeyException | InvalidKeySpecException |
                  StorageTransactionLogicException | SignatureException | IllegalBlockSizeException |

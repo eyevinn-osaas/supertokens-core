@@ -25,7 +25,7 @@ import io.supertokens.pluginInterface.StorageUtils;
 import io.supertokens.pluginInterface.authRecipe.AuthRecipeUserInfo;
 import io.supertokens.pluginInterface.authRecipe.LoginMethod;
 import io.supertokens.pluginInterface.bulkimport.exceptions.BulkImportBatchInsertException;
-import io.supertokens.pluginInterface.emailpassword.exceptions.UnknownUserIdException;
+import io.supertokens.pluginInterface.authRecipe.exceptions.UnknownUserIdException;
 import io.supertokens.pluginInterface.emailverification.EmailVerificationStorage;
 import io.supertokens.pluginInterface.exceptions.StorageQueryException;
 import io.supertokens.pluginInterface.exceptions.StorageTransactionLogicException;
@@ -49,6 +49,7 @@ import org.jetbrains.annotations.TestOnly;
 import javax.annotation.Nullable;
 import java.util.*;
 import java.util.stream.Collectors;
+import io.supertokens.auditlog.UnauditedTransaction;
 
 public class UserIdMapping {
 
@@ -416,26 +417,35 @@ public class UserIdMapping {
         }
     }
 
+    public static String getExternalUserId(AppIdentifier appIdentifier, Storage storage, String userId)
+            throws StorageQueryException {
+        io.supertokens.pluginInterface.useridmapping.UserIdMapping mapping = getUserIdMapping(appIdentifier, storage, userId, UserIdType.SUPERTOKENS);
+        if (mapping == null || mapping.externalUserId == null) {
+            return userId;
+        } else {
+            return mapping.externalUserId;
+        }
+    }
+
+    // A single read, so it runs as a plain autocommit read: wrapping it in a transaction only adds round trips.
     public static io.supertokens.pluginInterface.useridmapping.UserIdMapping getUserIdMapping(
             AppIdentifier appIdentifier, Storage storage, String userId,
             UserIdType userIdType)
             throws StorageQueryException {
-        UserIdMappingSQLStorage uidMappingStorage =
-                (UserIdMappingSQLStorage) storage;
+        UserIdMappingStorage uidMappingStorage = StorageUtils.getUserIdMappingStorage(storage);
 
-        try {
-            return uidMappingStorage.startTransaction(con -> {
-                return getUserIdMapping(con, appIdentifier, uidMappingStorage, userId, userIdType);
-            });
-        } catch (StorageTransactionLogicException e) {
-            if (e.actualException instanceof StorageQueryException) {
-                throw (StorageQueryException) e.actualException;
-            } else {
-                throw new IllegalStateException(e.actualException);
-            }
+        if (userIdType == UserIdType.SUPERTOKENS) {
+            return uidMappingStorage.getUserIdMapping(appIdentifier, userId, true);
         }
+
+        if (userIdType == UserIdType.EXTERNAL) {
+            return uidMappingStorage.getUserIdMapping(appIdentifier, userId, false);
+        }
+
+        return findMappingForAnyUserId(uidMappingStorage.getUserIdMapping(appIdentifier, userId), userId);
     }
 
+    @UnauditedTransaction(justification = "Legacy unaudited transaction (PLAN-012 backlog); pending conversion to startAuditedTransaction or read-only exemption.")
     public static List<io.supertokens.pluginInterface.useridmapping.UserIdMapping> getMultipleUserIdMapping(
             AppIdentifier appIdentifier, Storage storage, List<String> userIds,
             UserIdType userIdType)
@@ -472,10 +482,14 @@ public class UserIdMapping {
             return uidMappingStorage.getUserIdMapping_Transaction(con, appIdentifier, userId, false);
         }
 
-        io.supertokens.pluginInterface.useridmapping.UserIdMapping[] userIdMappings =
-                uidMappingStorage.getUserIdMapping_Transaction(
-                        con, appIdentifier, userId);
+        return findMappingForAnyUserId(uidMappingStorage.getUserIdMapping_Transaction(con, appIdentifier, userId),
+                userId);
+    }
 
+    // Picks the mapping for a UserIdType.ANY lookup, where userId may match one mapping as a SuperTokens user id
+    // and another as an external user id.
+    private static io.supertokens.pluginInterface.useridmapping.UserIdMapping findMappingForAnyUserId(
+            io.supertokens.pluginInterface.useridmapping.UserIdMapping[] userIdMappings, String userId) {
         if (userIdMappings.length == 0) {
             return null;
         }
@@ -687,6 +701,26 @@ public class UserIdMapping {
     public static void populateExternalUserIdForUsers(AppIdentifier appIdentifier, Storage storage,
                                                       AuthRecipeUserInfo[] users)
             throws StorageQueryException {
+        HashMap<String, String> userIdMappings = getUserIdMappingForSuperTokensUserIds(appIdentifier, storage,
+                collectSuperTokensUserIds(users));
+        applyExternalUserIds(users, userIdMappings);
+    }
+
+    public static void populateExternalUserIdForUsers(TransactionConnection con, AppIdentifier appIdentifier,
+                                                      Storage storage, AuthRecipeUserInfo[] users)
+            throws StorageQueryException {
+        // userIds are already filtered for a tenant
+        List<io.supertokens.pluginInterface.useridmapping.UserIdMapping> mappings =
+                ((UserIdMappingSQLStorage) storage).getMultipleUserIdMapping_Transaction(con, appIdentifier,
+                        collectSuperTokensUserIds(users), true);
+        HashMap<String, String> userIdMappings = new HashMap<>();
+        for (io.supertokens.pluginInterface.useridmapping.UserIdMapping mapping : mappings) {
+            userIdMappings.put(mapping.superTokensUserId, mapping.externalUserId);
+        }
+        applyExternalUserIds(users, userIdMappings);
+    }
+
+    private static ArrayList<String> collectSuperTokensUserIds(AuthRecipeUserInfo[] users) {
         Set<String> userIds = new HashSet<>();
 
         for (AuthRecipeUserInfo user : users) {
@@ -696,11 +730,10 @@ public class UserIdMapping {
                 userIds.add(lm.getSupertokensUserId());
             }
         }
-        ArrayList<String> userIdsList = new ArrayList<>(userIds);
-        userIdsList.addAll(userIds);
-        HashMap<String, String> userIdMappings = getUserIdMappingForSuperTokensUserIds(appIdentifier, storage,
-                userIdsList);
+        return new ArrayList<>(userIds);
+    }
 
+    private static void applyExternalUserIds(AuthRecipeUserInfo[] users, HashMap<String, String> userIdMappings) {
         for (AuthRecipeUserInfo user : users) {
             user.setExternalUserId(userIdMappings.get(user.getSupertokensUserId()));
 

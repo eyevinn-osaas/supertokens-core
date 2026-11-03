@@ -21,7 +21,6 @@ import io.supertokens.pluginInterface.Storage;
 import io.supertokens.pluginInterface.exceptions.StorageQueryException;
 import io.supertokens.pluginInterface.multitenancy.AppIdentifier;
 import io.supertokens.pluginInterface.multitenancy.exceptions.TenantOrAppNotFoundException;
-import io.supertokens.pluginInterface.opentelemetry.WithinOtelSpan;
 import io.supertokens.storageLayer.StorageLayer;
 import io.supertokens.utils.RateLimiter;
 import io.supertokens.webserver.WebserverAPI;
@@ -33,7 +32,7 @@ import java.io.IOException;
 
 // the point of this API is only to test that the server is up and running.
 
-@WithinOtelSpan
+//@WithinOtelSpan
 public class HelloAPI extends WebserverAPI {
 
     private static final long serialVersionUID = 1L;
@@ -50,6 +49,13 @@ public class HelloAPI extends WebserverAPI {
     @Override
     public String getPath() {
         return "/hello";
+    }
+
+    @Override
+    public RouteScope getRouteScope() {
+        // Existing readiness check (with its DB round-trip). Served on the admin pool as well as the main port,
+        // permanently — existing callers on the main port must keep working. Never forced to ADMIN_ONLY.
+        return RouteScope.ADMIN_PREFERRED;
     }
 
     @Override

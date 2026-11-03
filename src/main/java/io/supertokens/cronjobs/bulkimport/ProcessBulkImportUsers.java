@@ -17,8 +17,9 @@
 package io.supertokens.cronjobs.bulkimport;
 
 import io.supertokens.Main;
+import io.supertokens.ProcessState;
 import io.supertokens.bulkimport.BulkImport;
-import io.supertokens.bulkimport.BulkImportUserUtils;
+import io.supertokens.bulkimport.BulkImportProxyStoragePools;
 import io.supertokens.config.Config;
 import io.supertokens.cronjobs.CronTask;
 import io.supertokens.cronjobs.CronTaskTest;
@@ -26,8 +27,8 @@ import io.supertokens.output.Logging;
 import io.supertokens.pluginInterface.STORAGE_TYPE;
 import io.supertokens.pluginInterface.StorageUtils;
 import io.supertokens.pluginInterface.bulkimport.BulkImportStorage;
-import io.supertokens.pluginInterface.bulkimport.BulkImportUser;
 import io.supertokens.pluginInterface.bulkimport.sqlStorage.BulkImportSQLStorage;
+import io.supertokens.pluginInterface.exceptions.DbInitException;
 import io.supertokens.pluginInterface.exceptions.StorageQueryException;
 import io.supertokens.pluginInterface.multitenancy.AppIdentifier;
 import io.supertokens.pluginInterface.multitenancy.TenantIdentifier;
@@ -36,14 +37,11 @@ import io.supertokens.storageLayer.StorageLayer;
 
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Map;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
-import java.util.concurrent.atomic.AtomicInteger;
-import java.util.stream.Collectors;
-import java.util.stream.Stream;
+import java.util.concurrent.TimeUnit;
 
 public class ProcessBulkImportUsers extends CronTask {
 
@@ -78,86 +76,98 @@ public class ProcessBulkImportUsers extends CronTask {
         int bulkMigrationBatchSize = Config.getConfig(app.getAsPublicTenantIdentifier(), main)
                 .getBulkMigrationBatchSize();
 
+        // Cheap pre-check: workers create a throwaway HikariCP pool (plus a createTablesIfNotExists
+        // pass) per user pool BEFORE they discover the queue is empty. For apps that never use bulk
+        // import - the overwhelming majority, every 5 minutes, forever - that is pure waste. Both
+        // counts below are index-backed (bulk_import_users_status_updated_at_index on
+        // (app_id, status, updated_at)).
+        // A user moving NEW->PROCESSING between the two counts may be counted twice, which only
+        // inflates the sum - the safe direction (we run the workers and they find nothing).
+        long pendingUsers = bulkImportSQLStorage.getBulkImportUsersCount(app, BulkImportStorage.BULK_IMPORT_USER_STATUS.NEW)
+                + bulkImportSQLStorage.getBulkImportUsersCount(app, BulkImportStorage.BULK_IMPORT_USER_STATUS.PROCESSING);
+        if (pendingUsers == 0) {
+            Logging.debug(main, app.getAsPublicTenantIdentifier(),
+                    "CronTask skipped: no bulk import users to process.");
+            ProcessState.getInstance(main).addState(ProcessState.PROCESS_STATE.BULK_IMPORT_SKIPPED_EMPTY_QUEUE, null);
+            return;
+        }
+
         Logging.debug(main, app.getAsPublicTenantIdentifier(), "CronTask starts. Instance: " + this);
         Logging.debug(main, app.getAsPublicTenantIdentifier(), "CronTask starts. Processing bulk import users with " + bulkMigrationBatchSize
                 + " batch size, one batch split into " + numberOfBatchChunks + " chunks");
 
-        executorService = Executors.newFixedThreadPool(numberOfBatchChunks);
-
         String[] allUserRoles = StorageUtils.getUserRolesStorage(bulkImportSQLStorage).getRoles(app);
-        BulkImportUserUtils bulkImportUserUtils = new BulkImportUserUtils(allUserRoles);
 
-        long newUsers = bulkImportSQLStorage.getBulkImportUsersCount(app, BulkImportStorage.BULK_IMPORT_USER_STATUS.NEW);
-        long processingUsers = bulkImportSQLStorage.getBulkImportUsersCount(app, BulkImportStorage.BULK_IMPORT_USER_STATUS.PROCESSING);
-        long failedUsers = 0;
-        //taking a "snapshot" here and processing in this round as many users as there are uploaded now. After this the processing will go on
-        //with another app and gets back here when all the apps had a chance.
-        long usersProcessed = 0;
+        // Each worker self-selects its own chunk using SELECT FOR UPDATE SKIP LOCKED inside a transaction,
+        // which it keeps open until it deletes (or error-marks) those same rows. Workers stop when
+        // all return false (nothing left in the queue for this round).
+        int chunkSize = Math.max(1, bulkMigrationBatchSize / numberOfBatchChunks);
+        Logging.debug(main, app.getAsPublicTenantIdentifier(),
+                "CronTask starts. batch=" + bulkMigrationBatchSize + " parallelism=" + numberOfBatchChunks
+                        + " chunkSize=" + chunkSize);
 
-        Logging.debug(main, app.getAsPublicTenantIdentifier(), "Found " + (newUsers + processingUsers) + " waiting for processing"
-                + " (" + newUsers + " new, " + processingUsers + " processing)");
-        try {
-            while (usersProcessed < (newUsers + processingUsers)) {
-
-                List<BulkImportUser> users = bulkImportSQLStorage.getBulkImportUsersAndChangeStatusToProcessing(app,
-                        bulkMigrationBatchSize);
-
-                Logging.debug(main, app.getAsPublicTenantIdentifier(), "Loaded " + users.size() + " users to process");
-
-                if (users == null || users.isEmpty()) {
-                    // "No more users to process!"
-                    break;
-                }
-
-                List<List<BulkImportUser>> loadedUsersChunks = makeChunksOf(users, numberOfBatchChunks);
-                for (List<BulkImportUser> chunk : loadedUsersChunks) {
-                    Logging.debug(main, app.getAsPublicTenantIdentifier(), "Chunk size: " + chunk.size());
-                }
-
-                try {
-                    List<Future<?>> tasks = new ArrayList<>();
-                    for (int i = 0; i < numberOfBatchChunks && i < loadedUsersChunks.size(); i++) {
-                        tasks.add(
-                                executorService.submit(
-                                        new ProcessBulkUsersImportWorker(main, app, loadedUsersChunks.get(i),
-                                                bulkImportSQLStorage, bulkImportUserUtils)));
+        // The import runs on its own bounded pool(s) — one connection per worker — opened only now that we
+        // know there is work, and closed when this app's run ends. The live pool serving API traffic is
+        // never borrowed from while rows are held.
+        boolean anyProcessed = false;
+        try (BulkImportProxyStoragePools pools = BulkImportProxyStoragePools.openForApp(main, app,
+                numberOfBatchChunks)) {
+            executorService = Executors.newFixedThreadPool(numberOfBatchChunks);
+            try {
+                while (true) {
+                    List<Future<Boolean>> tasks = new ArrayList<>();
+                    for (int i = 0; i < numberOfBatchChunks; i++) {
+                        tasks.add(executorService.submit(
+                                new ProcessBulkUsersImportWorker(main, app, chunkSize, pools, allUserRoles)));
                     }
 
-                    for (Future<?> task : tasks) {
-                        while (!task.isDone()) {
-                            Logging.debug(main, app.getAsPublicTenantIdentifier(),
-                                    "Waiting for task " + task + " to finish");
-                            Thread.sleep(1000);
-                        }
-                        Logging.debug(main, app.getAsPublicTenantIdentifier(), "Task " + task + " finished");
+                    boolean roundHadWork = false;
+                    for (Future<Boolean> task : tasks) {
                         try {
-                            Void result = (Void) task.get(); //to know if there were any errors while executing and for
-                            // waiting in this thread for all the other threads to finish up
-                            Logging.debug(main, app.getAsPublicTenantIdentifier(),
-                                    "Task " + task + " finished with result: " + result);
+                            if (task.get()) {
+                                roundHadWork = true;
+                                anyProcessed = true;
+                            }
                         } catch (ExecutionException executionException) {
                             Logging.error(main, app.getAsPublicTenantIdentifier(),
-                                    "Error while processing bulk import users", true,
-                                    executionException);
+                                    "Error while processing bulk import users", true, executionException);
                             throw new RuntimeException(executionException);
                         }
-                        usersProcessed += loadedUsersChunks.get(tasks.indexOf(task)).size();
-                        failedUsers = bulkImportSQLStorage.getBulkImportUsersCount(app,
-                                BulkImportStorage.BULK_IMPORT_USER_STATUS.FAILED);
-                        Logging.debug(main, app.getAsPublicTenantIdentifier(),
-                                "Chunk " + tasks.indexOf(task) + " finished processing, all chunks processed: "
-                                        + usersProcessed + " users (" + failedUsers + " failed)");
                     }
-                    Logging.debug(main, app.getAsPublicTenantIdentifier(), "Processing round finished");
-                } catch (InterruptedException e) {
-                    Logging.error(main, app.getAsPublicTenantIdentifier(), "Error while processing bulk import users",
-                            true,
-                            e);
-                    throw new RuntimeException(e);
+
+                    Logging.debug(main, app.getAsPublicTenantIdentifier(),
+                            "Processing round finished, hadWork=" + roundHadWork);
+                    if (!roundHadWork) {
+                        break;
+                    }
+                    Integer sleepBetweenRounds = Config.getConfig(app.getAsPublicTenantIdentifier(), main)
+                            .getBulkMigrationSleepBetweenRoundsInBatchMs();
+                    if (null != sleepBetweenRounds) {
+                        Thread.sleep(sleepBetweenRounds);
+                    }
+                }
+            } finally {
+                // Let every worker finish (or be interrupted) before the pools underneath them are closed.
+                executorService.shutdownNow();
+                if (!executorService.awaitTermination(1, TimeUnit.MINUTES)) {
+                    Logging.warn(main, app.getAsPublicTenantIdentifier(),
+                            "Bulk import workers did not stop within a minute; closing their pools anyway");
                 }
             }
-        } finally {
-            executorService.shutdownNow();
+        } catch (InterruptedException | DbInitException e) {
+            Logging.error(main, app.getAsPublicTenantIdentifier(), "Error while processing bulk import users", true, e);
+            throw new RuntimeException(e);
+        }
+
+        // Signal completion for tests that wait on this event.
+        // Only fire when users were actually processed to avoid spurious events
+        // when the cron runs before any users are uploaded.
+        if (anyProcessed) {
+            long remaining = bulkImportSQLStorage.getBulkImportUsersCount(app, BulkImportStorage.BULK_IMPORT_USER_STATUS.NEW)
+                    + bulkImportSQLStorage.getBulkImportUsersCount(app, BulkImportStorage.BULK_IMPORT_USER_STATUS.PROCESSING);
+            if (remaining == 0) {
+                ProcessState.getInstance(main).addState(ProcessState.PROCESS_STATE.BULK_IMPORT_COMPLETE, null);
+            }
         }
     }
 
@@ -183,19 +193,5 @@ public class ProcessBulkImportUsers extends CronTask {
         return 0;
     }
 
-    private List<List<BulkImportUser>> makeChunksOf(List<BulkImportUser> users, int numberOfChunks) {
-        List<List<BulkImportUser>> chunks = new ArrayList<>();
-        if (users != null && !users.isEmpty() && numberOfChunks > 0) {
-            AtomicInteger index = new AtomicInteger(0);
-            int chunkSize = users.size() / numberOfChunks + 1;
-            Stream<List<BulkImportUser>> listStream = users.stream()
-                    .collect(Collectors.groupingBy(x -> index.getAndIncrement() / chunkSize))
-                    .entrySet().stream()
-                    .sorted(Map.Entry.comparingByKey()).map(Map.Entry::getValue);
-
-            listStream.forEach(chunks::add);
-        }
-        return chunks;
-    }
 
 }

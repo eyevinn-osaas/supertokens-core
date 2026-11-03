@@ -18,7 +18,12 @@ package io.supertokens.thirdparty;
 
 import io.supertokens.Main;
 import io.supertokens.ResourceDistributor;
-import io.supertokens.emailpassword.exceptions.EmailChangeNotAllowedException;
+import io.supertokens.auditlog.AuditLog;
+import io.supertokens.pluginInterface.auditlog.ActivityLogSQLStorage;
+import io.supertokens.pluginInterface.auditlog.AuditLogEvent;
+import io.supertokens.pluginInterface.auditlog.AuditedResult;
+import io.supertokens.auditlog.lifecycle.LifecycleAuditEvent;
+import io.supertokens.pluginInterface.authRecipe.exceptions.EmailChangeNotAllowedException;
 import io.supertokens.multitenancy.Multitenancy;
 import io.supertokens.multitenancy.exception.BadPermissionException;
 import io.supertokens.pluginInterface.RECIPE_ID;
@@ -26,7 +31,9 @@ import io.supertokens.pluginInterface.Storage;
 import io.supertokens.pluginInterface.StorageUtils;
 import io.supertokens.pluginInterface.authRecipe.AuthRecipeUserInfo;
 import io.supertokens.pluginInterface.authRecipe.LoginMethod;
+import io.supertokens.pluginInterface.authRecipe.exceptions.UnknownUserIdException;
 import io.supertokens.pluginInterface.authRecipe.sqlStorage.AuthRecipeSQLStorage;
+import io.supertokens.pluginInterface.emailpassword.exceptions.DuplicateEmailException;
 import io.supertokens.pluginInterface.emailverification.sqlStorage.EmailVerificationSQLStorage;
 import io.supertokens.pluginInterface.exceptions.StorageQueryException;
 import io.supertokens.pluginInterface.exceptions.StorageTransactionLogicException;
@@ -39,6 +46,9 @@ import io.supertokens.pluginInterface.thirdparty.ThirdPartyImportUser;
 import io.supertokens.pluginInterface.thirdparty.exception.DuplicateThirdPartyUserException;
 import io.supertokens.pluginInterface.thirdparty.exception.DuplicateUserIdException;
 import io.supertokens.pluginInterface.thirdparty.sqlStorage.ThirdPartySQLStorage;
+import io.supertokens.pluginInterface.useridmapping.LockedUser;
+import io.supertokens.pluginInterface.useridmapping.UserLockingStorage;
+import io.supertokens.pluginInterface.useridmapping.UserNotFoundForLockingException;
 import io.supertokens.storageLayer.StorageLayer;
 import io.supertokens.utils.Utils;
 import org.jetbrains.annotations.TestOnly;
@@ -48,6 +58,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashSet;
 import java.util.List;
+import io.supertokens.auditlog.UnauditedTransaction;
 
 public class ThirdParty {
 
@@ -65,6 +76,7 @@ public class ThirdParty {
     // as seen below. But then, in newer versions, we stopped doing that cause of
     // https://github.com/supertokens/supertokens-core/issues/295, so we changed the API spec.
     @Deprecated
+    @UnauditedTransaction(justification = "Legacy unaudited transaction (PLAN-012 backlog); pending conversion to startAuditedTransaction or read-only exemption.")
     public static SignInUpResponse signInUp2_7(TenantIdentifier tenantIdentifier, Storage storage,
                                                String thirdPartyId, String thirdPartyUserId, String email,
                                                boolean isEmailVerified)
@@ -157,6 +169,7 @@ public class ThirdParty {
         return signInUp(tenantIdentifier, storage, main, thirdPartyId, thirdPartyUserId, email, false);
     }
 
+    @UnauditedTransaction(justification = "Legacy unaudited transaction (PLAN-012 backlog); pending conversion to startAuditedTransaction or read-only exemption.")
     public static SignInUpResponse signInUp(TenantIdentifier tenantIdentifier, Storage storage, Main main,
                                             String thirdPartyId,
                                             String thirdPartyUserId, String email, boolean isEmailVerified)
@@ -200,9 +213,16 @@ public class ThirdParty {
             }
         }
 
+        AuditLog.emit(main, storage, tenantIdentifier, new AuditLogEvent(
+                tenantIdentifier.getAppId(), tenantIdentifier.getTenantId(),
+                response.user.getSupertokensUserId(), response.user.getSupertokensUserId(),
+                response.createdNewUser ? "thirdparty_sign_up" : "thirdparty_sign_in",
+                "success", thirdPartyId, email,
+                System.currentTimeMillis(), null));
         return response;
     }
 
+    @UnauditedTransaction(justification = "Legacy unaudited transaction (PLAN-012 backlog); pending conversion to startAuditedTransaction or read-only exemption.")
     private static SignInUpResponse signInUpHelper(TenantIdentifier tenantIdentifier, Storage storage,
                                                    String thirdPartyId, String thirdPartyUserId,
                                                    String email) throws StorageQueryException,
@@ -259,6 +279,7 @@ public class ThirdParty {
                 } else {
                     // Email needs updating, so repeat everything in a transaction
                     try {
+                        UserLockingStorage lockingStorage = (UserLockingStorage) storage;
 
                         tpStorage.startTransaction(con -> {
                             AuthRecipeUserInfo userFromDb1 = null;
@@ -296,29 +317,19 @@ public class ThirdParty {
                             }
 
                             if (!email.equals(lM1.email)) {
-                                // before updating the email, we must check for if another primary user has the same
-                                // email, and if they do, then we do not allow the update.
-                                if (userFromDb1.isPrimaryUser) {
-                                    for (String tenantId : userFromDb1.tenantIds) {
-                                        AuthRecipeUserInfo[] userBasedOnEmail =
-                                                authRecipeStorage.listPrimaryUsersByEmail_Transaction(
-                                                        appIdentifier, con, email
-                                                );
-                                        for (AuthRecipeUserInfo userWithSameEmail : userBasedOnEmail) {
-                                            if (!userWithSameEmail.tenantIds.contains(tenantId)) {
-                                                continue;
-                                            }
-                                            if (userWithSameEmail.isPrimaryUser &&
-                                                    !userWithSameEmail.getSupertokensUserId()
-                                                            .equals(userFromDb1.getSupertokensUserId())) {
-                                                throw new StorageTransactionLogicException(
-                                                        new EmailChangeNotAllowedException());
-                                            }
-                                        }
-                                    }
+                                try {
+                                    // Acquire lock on the user to prevent race conditions during email update
+                                    LockedUser lockedUser = lockingStorage.lockUser(appIdentifier, con,
+                                            lM1.getSupertokensUserId());
+
+                                    tpStorage.updateUserEmail_Transaction(appIdentifier, con, lM1.getSupertokensUserId(),
+                                            thirdPartyId, thirdPartyUserId, email);
+                                } catch (EmailChangeNotAllowedException | DuplicateEmailException |
+                                         UnknownUserIdException e) {
+                                    throw new StorageTransactionLogicException(e);
+                                } catch (UserNotFoundForLockingException e) {
+                                    throw new StorageTransactionLogicException(new UnknownUserIdException());
                                 }
-                                tpStorage.updateUserEmail_Transaction(appIdentifier, con,
-                                        thirdPartyId, thirdPartyUserId, email);
                             }
 
                             tpStorage.commitTransaction(con);
@@ -327,6 +338,10 @@ public class ThirdParty {
                     } catch (StorageTransactionLogicException e) {
                         if (e.actualException instanceof EmailChangeNotAllowedException) {
                             throw (EmailChangeNotAllowedException) e.actualException;
+                        } else if (e.actualException instanceof DuplicateEmailException) {
+                            throw new IllegalStateException("should never happen", e);
+                        } else if (e.actualException instanceof UnknownUserIdException) {
+                            throw new IllegalStateException("should never happen", e);
                         }
                         throw new StorageQueryException(e);
                     }
@@ -342,21 +357,44 @@ public class ThirdParty {
             String thirdPartyId, String thirdPartyUserId, String email, long timeJoined)
             throws StorageQueryException, TenantOrAppNotFoundException, DuplicateThirdPartyUserException {
         ThirdPartySQLStorage tpStorage = StorageUtils.getThirdPartyStorage(storage);
+        ActivityLogSQLStorage auditStorage = (ActivityLogSQLStorage) storage;
+        AppIdentifier appIdentifier = tenantIdentifier.toAppIdentifier();
 
         while (true) {
             // loop for sign up
             String userId = Utils.getUUID();
 
             try {
-                AuthRecipeUserInfo createdUser = tpStorage.signUp(tenantIdentifier, userId, email,
-                            new LoginMethod.ThirdParty(thirdPartyId, thirdPartyUserId), timeJoined);
+                // Create the user and emit its user_creation event atomically on the same connection, so the
+                // event cannot be lost relative to the creation it records. The user-id retry loop on
+                // DuplicateUserIdException stays outside the transaction.
+                AuthRecipeUserInfo createdUser = auditStorage.startAuditedTransaction(appIdentifier, con -> {
+                    try {
+                        AuthRecipeUserInfo user = tpStorage.signUp_Transaction(tenantIdentifier, con, userId, email,
+                                new LoginMethod.ThirdParty(thirdPartyId, thirdPartyUserId), timeJoined);
+                        AuditLogEvent event = LifecycleAuditEvent.forUserCreation(appIdentifier,
+                                user.getSupertokensUserId(), tenantIdentifier.getTenantId(), timeJoined);
+                        return new AuditedResult<>(user, event);
+                    } catch (DuplicateUserIdException | DuplicateThirdPartyUserException e) {
+                        throw new StorageTransactionLogicException(e);
+                    }
+                });
                 return new SignInUpResponse(true, createdUser);
-            } catch (DuplicateUserIdException e) {
-                // we try again..
+            } catch (StorageTransactionLogicException e) {
+                if (e.actualException instanceof DuplicateUserIdException) {
+                    // we try again with a new userId
+                    continue;
+                } else if (e.actualException instanceof DuplicateThirdPartyUserException) {
+                    throw (DuplicateThirdPartyUserException) e.actualException;
+                } else if (e.actualException instanceof TenantOrAppNotFoundException) {
+                    throw (TenantOrAppNotFoundException) e.actualException;
+                }
+                throw new StorageQueryException(e.actualException);
             }
         }
     }
 
+    @UnauditedTransaction(justification = "Legacy unaudited transaction (PLAN-012 backlog); pending conversion to startAuditedTransaction or read-only exemption.")
     public static void createMultipleThirdPartyUsers(Storage storage,
                                                      List<ThirdPartyImportUser> usersToImport)
             throws StorageQueryException, StorageTransactionLogicException, TenantOrAppNotFoundException {

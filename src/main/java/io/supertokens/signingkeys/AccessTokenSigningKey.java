@@ -45,6 +45,7 @@ import org.jetbrains.annotations.TestOnly;
 
 import java.security.NoSuchAlgorithmException;
 import java.util.*;
+import io.supertokens.auditlog.UnauditedTransaction;
 
 public class AccessTokenSigningKey extends ResourceDistributor.SingletonResource {
     private static final String ACCESS_TOKEN_SIGNING_ALGO = "RS256";
@@ -62,13 +63,22 @@ public class AccessTokenSigningKey extends ResourceDistributor.SingletonResource
     private final Main main;
     private List<SigningKeys.KeyInfo> validKeys;
     private final AppIdentifier appIdentifier;
+    // set once transferLegacyKeyToNewTable has run for this app; read without the lock by ensureLegacyKeyTransferred
+    private volatile boolean legacyKeyTransferred = false;
 
     private AccessTokenSigningKey(AppIdentifier appIdentifier, Main main)
             throws TenantOrAppNotFoundException {
         this.main = main;
         this.appIdentifier = appIdentifier;
+        if (StorageLayer.isStorageStillInitialising(main, appIdentifier)) {
+            // Startup (or a tenant refresh) continued past this app's storage while it is still initialising;
+            // querying it here would wait for that. The legacy key is moved and the keys are loaded on first use.
+            Logging.info(main, appIdentifier.getAsPublicTenantIdentifier(),
+                    "Storage still initialising: access token signing keys will be loaded on first use", false);
+            return;
+        }
         try {
-            this.transferLegacyKeyToNewTable();
+            this.ensureLegacyKeyTransferred();
             this.getOrCreateAndGetSigningKeys();
         } catch (StorageQueryException | StorageTransactionLogicException e) {
             Logging.error(main, appIdentifier.getAsPublicTenantIdentifier(),
@@ -93,42 +103,43 @@ public class AccessTokenSigningKey extends ResourceDistributor.SingletonResource
 
     public static void loadForAllTenants(Main main, List<AppIdentifier> apps,
                                          List<TenantIdentifier> tenantsThatChanged) {
-        try {
-            main.getResourceDistributor().withResourceDistributorLock(() -> {
-                Map<ResourceDistributor.KeyClass, ResourceDistributor.SingletonResource> existingResources =
-                        main.getResourceDistributor()
-                                .getAllResourcesWithResourceKey(RESOURCE_KEY);
-                main.getResourceDistributor().clearAllResourcesWithResourceKey(RESOURCE_KEY);
-                for (AppIdentifier app : apps) {
-                    ResourceDistributor.SingletonResource resource = existingResources.get(
-                            new ResourceDistributor.KeyClass(
-                                    app,
-                                    RESOURCE_KEY));
-                    if (resource != null && !tenantsThatChanged.contains(app.getAsPublicTenantIdentifier())) {
-                        main.getResourceDistributor()
-                                .setResource(app,
-                                        RESOURCE_KEY,
-                                        resource);
-                    } else {
-                        try {
-                            main.getResourceDistributor()
-                                    .setResource(
-                                            app,
-                                            RESOURCE_KEY,
-                                            new AccessTokenSigningKey(app, main));
-                        } catch (Exception e) {
-                            Logging.error(main, app.getAsPublicTenantIdentifier(), e.getMessage(), false);
-                            // continue loading other resources
-                        }
-                    }
+        Map<ResourceDistributor.KeyClass, ResourceDistributor.SingletonResource> existingResources =
+                main.getResourceDistributor()
+                        .getAllResourcesWithResourceKey(RESOURCE_KEY);
+        Map<ResourceDistributor.KeyClass, ResourceDistributor.SingletonResource> newResources =
+                new HashMap<>();
+        for (AppIdentifier app : apps) {
+            ResourceDistributor.SingletonResource resource = existingResources.get(
+                    new ResourceDistributor.KeyClass(app, RESOURCE_KEY));
+            if (resource != null && !tenantsThatChanged.contains(app.getAsPublicTenantIdentifier())) {
+                newResources.put(new ResourceDistributor.KeyClass(app, RESOURCE_KEY), resource);
+            } else {
+                try {
+                    newResources.put(new ResourceDistributor.KeyClass(app, RESOURCE_KEY),
+                            new AccessTokenSigningKey(app, main));
+                } catch (Exception e) {
+                    Logging.error(main, app.getAsPublicTenantIdentifier(), e.getMessage(), false);
+                    // continue loading other resources
                 }
-                return null;
-            });
-        } catch (ResourceDistributor.FuncException e) {
-            throw new IllegalStateException("should never happen", e);
+            }
+        }
+        main.getResourceDistributor().replaceResourcesWithResourceKey(RESOURCE_KEY, newResources);
+    }
+
+    /**
+     * Moves a legacy access token signing key into the new tables once, before any key is read. This used to run
+     * only in the constructor, which skips it while the app's storage is still initialising, so every key read
+     * calls this first: otherwise a new key could be generated in place of the legacy one, and access tokens
+     * signed with it would no longer verify.
+     */
+    public void ensureLegacyKeyTransferred()
+            throws StorageQueryException, StorageTransactionLogicException, TenantOrAppNotFoundException {
+        if (!this.legacyKeyTransferred) {
+            this.transferLegacyKeyToNewTable();
         }
     }
 
+    @UnauditedTransaction(justification = "System signing-key or certificate housekeeping; no user-facing state change to audit.")
     public synchronized void transferLegacyKeyToNewTable()
             throws StorageQueryException, StorageTransactionLogicException, TenantOrAppNotFoundException {
         Storage storage = StorageLayer.getStorage(this.appIdentifier.getAsPublicTenantIdentifier(), main);
@@ -205,6 +216,7 @@ public class AccessTokenSigningKey extends ResourceDistributor.SingletonResource
                 noSQLStorage.removeLegacyAccessTokenSigningKey_Transaction();
             }
         }
+        this.legacyKeyTransferred = true;
     }
 
     public synchronized void cleanExpiredAccessTokenSigningKeys() throws StorageQueryException,
@@ -219,8 +231,10 @@ public class AccessTokenSigningKey extends ResourceDistributor.SingletonResource
         storage.removeAccessTokenSigningKeysBefore(appIdentifier, System.currentTimeMillis() - signingKeyLifetime);
     }
 
+    @UnauditedTransaction(justification = "System signing-key or certificate housekeeping; no user-facing state change to audit.")
     public List<SigningKeys.KeyInfo> getOrCreateAndGetSigningKeys()
             throws StorageQueryException, StorageTransactionLogicException, TenantOrAppNotFoundException {
+        this.ensureLegacyKeyTransferred();
         Storage storage = StorageLayer.getStorage(this.appIdentifier.getAsPublicTenantIdentifier(), main);
         CoreConfig config = Config.getConfig(appIdentifier.getAsPublicTenantIdentifier(), main);
 

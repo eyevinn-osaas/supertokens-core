@@ -37,11 +37,20 @@ import io.supertokens.pluginInterface.StorageUtils;
 import io.supertokens.pluginInterface.authRecipe.AuthRecipeStorage;
 import io.supertokens.pluginInterface.authRecipe.AuthRecipeUserInfo;
 import io.supertokens.pluginInterface.authRecipe.LoginMethod;
+import io.supertokens.pluginInterface.authRecipe.exceptions.EmailChangeNotAllowedException;
+import io.supertokens.pluginInterface.authRecipe.exceptions.UnknownUserIdException;
 import io.supertokens.pluginInterface.authRecipe.sqlStorage.AuthRecipeSQLStorage;
+import io.supertokens.auditlog.lifecycle.LifecycleAuditEvent;
+import io.supertokens.pluginInterface.auditlog.ActivityLogSQLStorage;
+import io.supertokens.pluginInterface.auditlog.AuditLogEvent;
+import io.supertokens.pluginInterface.auditlog.AuditedResult;
+import io.supertokens.pluginInterface.emailpassword.exceptions.DuplicateEmailException;
 import io.supertokens.pluginInterface.exceptions.StorageQueryException;
+import io.supertokens.pluginInterface.multitenancy.AppIdentifier;
 import io.supertokens.pluginInterface.exceptions.StorageTransactionLogicException;
 import io.supertokens.pluginInterface.multitenancy.TenantIdentifier;
 import io.supertokens.pluginInterface.multitenancy.exceptions.TenantOrAppNotFoundException;
+import io.supertokens.pluginInterface.sqlStorage.TransactionConnection;
 import io.supertokens.pluginInterface.webauthn.AccountRecoveryTokenInfo;
 import io.supertokens.pluginInterface.webauthn.WebAuthNOptions;
 import io.supertokens.pluginInterface.webauthn.WebAuthNStorage;
@@ -67,6 +76,7 @@ import java.security.spec.InvalidKeySpecException;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.List;
+import io.supertokens.auditlog.UnauditedTransaction;
 
 public class WebAuthN {
 
@@ -183,7 +193,7 @@ public class WebAuthN {
                                                                  String optionsId, JsonObject credentialsDataJson)
             throws InvalidWebauthNOptionsException, StorageQueryException, WebauthNVerificationFailedException,
             WebauthNInvalidFormatException, WebauthNOptionsNotExistsException, DuplicateCredentialException,
-            UserIdNotFoundException, TenantOrAppNotFoundException {
+            UnknownUserIdException, TenantOrAppNotFoundException {
 
         WebAuthNStorage webAuthNStorage = (WebAuthNStorage) storage;
         WebAuthNOptions generatedOptions = webAuthNStorage.loadOptionsById(tenantIdentifier, optionsId);
@@ -281,18 +291,22 @@ public class WebAuthN {
 
     public static WebAuthNSignInUpResult signUp(Storage storage, TenantIdentifier tenantIdentifier,
                                                 String optionsId, JsonObject credentialDataJson)
-            throws InvalidWebauthNOptionsException, DuplicateUserEmailException, WebauthNVerificationFailedException,
+            throws InvalidWebauthNOptionsException, DuplicateEmailException, WebauthNVerificationFailedException,
             StorageQueryException, WebauthNOptionsNotExistsException, WebauthNInvalidFormatException{
         // create a new user in the auth recipe storage
         // create new credentials
-        // all within a transaction
+        // emit the user_creation event
+        // all within a single audited transaction, so the event commits atomically with the new user
         try {
             WebAuthNSQLStorage webAuthNStorage = StorageUtils.getWebAuthNStorage(storage);
-            return webAuthNStorage.startTransaction(con -> {
+            ActivityLogSQLStorage auditStorage = (ActivityLogSQLStorage) storage;
+            AppIdentifier appIdentifier = tenantIdentifier.toAppIdentifier();
+            return auditStorage.startAuditedTransaction(appIdentifier, con -> {
 
                 while (true) {
                     try {
                         String recipeUserId = Utils.getUUID();
+                        long timeJoined = System.currentTimeMillis();
 
                         WebAuthNOptions generatedOptions = webAuthNStorage.loadOptionsById_Transaction(tenantIdentifier,
                                 con,
@@ -315,11 +329,14 @@ public class WebAuthN {
                                 generatedOptions.relyingPartyId, credentialToSave);
                         userInfo.setExternalUserId(null);
 
-                        return new WebAuthNSignInUpResult(credentialToSave, userInfo, generatedOptions);
+                        AuditLogEvent event = LifecycleAuditEvent.forUserCreation(appIdentifier,
+                                userInfo.getSupertokensUserId(), tenantIdentifier.getTenantId(), timeJoined);
+                        return new AuditedResult<>(
+                                new WebAuthNSignInUpResult(credentialToSave, userInfo, generatedOptions), event);
                     } catch (DuplicateUserIdException duplicateUserIdException) {
                         //ignore and retry
                     } catch (InvalidWebauthNOptionsException | TenantOrAppNotFoundException |
-                             DuplicateUserEmailException | WebauthNVerificationFailedException |
+                             DuplicateEmailException | WebauthNVerificationFailedException |
                              WebauthNInvalidFormatException | WebauthNOptionsNotExistsException e) {
                         throw new StorageQueryException(e);
                     }
@@ -329,8 +346,8 @@ public class WebAuthN {
         } catch (StorageQueryException exception) {
             if (exception.getCause() instanceof InvalidWebauthNOptionsException) {
                 throw (InvalidWebauthNOptionsException) exception.getCause();
-            } else if (exception.getCause() instanceof DuplicateUserEmailException) {
-                throw (DuplicateUserEmailException) exception.getCause();
+            } else if (exception.getCause() instanceof DuplicateEmailException) {
+                throw (DuplicateEmailException) exception.getCause();
             } else if (exception.getCause() instanceof WebauthNVerificationFailedException) {
                 throw (WebauthNVerificationFailedException) exception.getCause();
             } else if (exception.getCause() instanceof WebauthNOptionsNotExistsException) {
@@ -354,23 +371,24 @@ public class WebAuthN {
     }
 
     @TestOnly
+    @UnauditedTransaction(justification = "Legacy unaudited transaction (PLAN-012 backlog); pending conversion to startAuditedTransaction or read-only exemption.")
     public static AuthRecipeUserInfo saveUser(Storage storage, TenantIdentifier tenantIdentifier, String email, String userId, String rpId)
-            throws StorageQueryException, TenantOrAppNotFoundException, DuplicateUserEmailException,
+            throws StorageQueryException, TenantOrAppNotFoundException, DuplicateEmailException,
             DuplicateUserIdException {
         WebAuthNSQLStorage webAuthNStorage = StorageUtils.getWebAuthNStorage(storage);
         try {
             return webAuthNStorage.startTransaction(con -> {
                 try {
                     return webAuthNStorage.signUp_Transaction(tenantIdentifier, con, userId, email, rpId);
-                } catch (TenantOrAppNotFoundException | DuplicateUserEmailException | DuplicateUserIdException e) {
+                } catch (TenantOrAppNotFoundException | DuplicateEmailException | DuplicateUserIdException e) {
                     throw new StorageTransactionLogicException(e);
                 }
             });
         } catch (StorageTransactionLogicException  e) {
             if (e.actualException instanceof TenantOrAppNotFoundException) {
                 throw (TenantOrAppNotFoundException) e.actualException;
-            } else if (e.actualException instanceof DuplicateUserEmailException) {
-                throw (DuplicateUserEmailException) e.actualException;
+            } else if (e.actualException instanceof DuplicateEmailException) {
+                throw (DuplicateEmailException) e.actualException;
             } else if (e.actualException instanceof DuplicateUserIdException) {
                 throw (DuplicateUserIdException) e.actualException;
             } else {
@@ -379,11 +397,13 @@ public class WebAuthN {
         }
     }
 
+    @UnauditedTransaction(justification = "Legacy unaudited transaction (PLAN-012 backlog); pending conversion to startAuditedTransaction or read-only exemption.")
     public static WebAuthNSignInUpResult signIn(Storage storage, TenantIdentifier tenantIdentifier,
-                                              String webauthnGeneratedOptionsId, JsonObject credentialsData)
+                                              String webauthnGeneratedOptionsId, JsonObject credentialsData,
+                                              boolean consumeOptions)
             throws InvalidWebauthNOptionsException, WebauthNVerificationFailedException,
             WebauthNInvalidFormatException, StorageQueryException, WebauthNOptionsNotExistsException,
-            WebauthNCredentialNotExistsException, UserIdNotFoundException {
+            WebauthNCredentialNotExistsException, UnknownUserIdException {
         try {
             WebAuthNSQLStorage webAuthNStorage = StorageUtils.getWebAuthNStorage(storage);
             return webAuthNStorage.startTransaction(con -> {
@@ -402,20 +422,37 @@ public class WebAuthN {
                     String credentialId = getCredentialId(credentialsData);
 
                     WebAuthNStoredCredential credential = webAuthNStorage.loadCredentialById_Transaction(tenantIdentifier,
-                            con, credentialId);
+                            con, generatedOptions.relyingPartyId, credentialId);
                     if(credential==null) {
                         throw new StorageTransactionLogicException(new WebauthNCredentialNotExistsException());
                     }
 
                     verifyAuthenticationData(credentialsData, generatedOptions, credential);
-                    webAuthNStorage.updateCounter_Transaction(tenantIdentifier, con, credentialId, credential.counter); //the verifyAuthenticatorData method's verify step updates the credential on this object. We have to save the updated value!
+                    webAuthNStorage.updateCounter_Transaction(tenantIdentifier, con, generatedOptions.relyingPartyId, credentialId, credential.counter); //the verifyAuthenticatorData method's verify step updates the credential on this object. We have to save the updated value!
+
+                    if (consumeOptions) {
+                        // challenges are single-use (WebAuthn L3 §13.4.3): consume the options atomically with
+                        // the successful verification so the same assertion cannot be replayed. Only done for
+                        // CDI >= 5.5 requests — older SDKs verify the same assertion twice per sign in.
+                        webAuthNStorage.removeOptions_Transaction(tenantIdentifier, con, webauthnGeneratedOptionsId);
+                    }
 
                     AuthRecipeUserInfo fullyLoadedUserInfo = StorageUtils.getAuthRecipeStorage(storage).getPrimaryUserByWebauthNCredentialId_Transaction(tenantIdentifier, con, credentialId);
                     if(fullyLoadedUserInfo == null) {
                         // this shouldn't ever happen!
-                        throw new StorageTransactionLogicException(new UserIdNotFoundException());
+                        throw new StorageTransactionLogicException(new UnknownUserIdException());
                     }
-                    UserIdMapping.populateExternalUserIdForUsers(tenantIdentifier.toAppIdentifier(), storage, new AuthRecipeUserInfo[]{fullyLoadedUserInfo});
+
+                    // Defense in depth (GHSA-6v34-w48w-44rc): the resolved credential owner must be a member of
+                    // the tenant this sign-in was requested for. The storage queries above already enforce tenant
+                    // membership; this recipe-layer check guards against any future storage path re-opening the
+                    // cross-tenant sign-in, independently of the backend.
+                    if (fullyLoadedUserInfo.tenantIds == null
+                            || !fullyLoadedUserInfo.tenantIds.contains(tenantIdentifier.getTenantId())) {
+                        throw new StorageTransactionLogicException(new WebauthNCredentialNotExistsException());
+                    }
+                    UserIdMapping.populateExternalUserIdForUsers(con, tenantIdentifier.toAppIdentifier(), storage,
+                            new AuthRecipeUserInfo[]{fullyLoadedUserInfo});
                     return new WebAuthNSignInUpResult(credential, fullyLoadedUserInfo, generatedOptions);
                 } catch (InvalidWebauthNOptionsException | WebauthNVerificationFailedException |
                          WebauthNInvalidFormatException  e) {
@@ -433,8 +470,8 @@ public class WebAuthN {
                 throw (WebauthNOptionsNotExistsException) e.getCause();
             } else if (e.getCause() instanceof WebauthNCredentialNotExistsException) {
                 throw (WebauthNCredentialNotExistsException) e.getCause();
-            } else if (e.getCause() instanceof UserIdNotFoundException) {
-                throw (UserIdNotFoundException) e.getCause();
+            } else if (e.getCause() instanceof UnknownUserIdException) {
+                throw (UnknownUserIdException) e.getCause();
             } else {
                 throw new StorageQueryException(e);
             }
@@ -502,14 +539,14 @@ public class WebAuthN {
 
     public static String generateRecoverAccountToken(Main main, Storage storage, TenantIdentifier tenantIdentifier, String email, String userIdFromRequest)
             throws NoSuchAlgorithmException, InvalidKeySpecException, TenantOrAppNotFoundException,
-            StorageQueryException, UserIdNotFoundException {
+            StorageQueryException, UnknownUserIdException {
 
         String userId = translateToInternalUserId(storage, tenantIdentifier, userIdFromRequest);
 
         AuthRecipeUserInfo user = AuthRecipe.getUserById(tenantIdentifier.toAppIdentifier(), storage, userId);
 
         if (user == null) {
-            throw new UserIdNotFoundException();
+            throw new UnknownUserIdException();
         }
 
         while (true) {
@@ -530,6 +567,7 @@ public class WebAuthN {
         }
     }
 
+    @UnauditedTransaction(justification = "Legacy unaudited transaction (PLAN-012 backlog); pending conversion to startAuditedTransaction or read-only exemption.")
     public static AccountRecoveryTokenInfo consumeRecoverAccountToken(Main main, TenantIdentifier tenantIdentifier, Storage storage, String token)
             throws StorageQueryException, NoSuchAlgorithmException, InvalidTokenException {
         WebAuthNSQLStorage webauthnStorage = StorageUtils.getWebAuthNStorage(storage);
@@ -564,6 +602,7 @@ public class WebAuthN {
         }
     }
 
+    @UnauditedTransaction(justification = "Legacy unaudited transaction (PLAN-012 backlog); pending conversion to startAuditedTransaction or read-only exemption.")
     public static AuthRecipeUserInfo getUserForToken(Storage storage, TenantIdentifier tenantIdentifier, String token)
             throws
             InvalidTokenException, StorageQueryException, NoSuchAlgorithmException {
@@ -632,20 +671,33 @@ public class WebAuthN {
         return userIdMapping == null ? userId : userIdMapping.superTokensUserId;
     }
 
+    // Transaction-scoped variant: resolves the mapping on the caller's connection, so the lookup runs in the
+    // same transaction as the surrounding work instead of borrowing a second connection from the same pool.
+    private static String translateToInternalUserId(TransactionConnection con, Storage storage,
+                                                    TenantIdentifier tenantIdentifier, String userId)
+            throws StorageQueryException {
+        io.supertokens.pluginInterface.useridmapping.UserIdMapping userIdMapping =
+                UserIdMapping.getUserIdMapping(con, tenantIdentifier.toAppIdentifier(), storage, userId, null);
+        return userIdMapping == null ? userId : userIdMapping.superTokensUserId;
+    }
+
+    @UnauditedTransaction(justification = "Legacy unaudited transaction (PLAN-012 backlog); pending conversion to startAuditedTransaction or read-only exemption.")
     public static void updateUserEmail(Storage storage, TenantIdentifier tenantIdentifier, String userId, String email)
-            throws StorageQueryException, UserIdNotFoundException, DuplicateUserEmailException,
+            throws StorageQueryException, UnknownUserIdException, DuplicateEmailException,
             EmailChangeNotAllowedException, StorageTransactionLogicException, TenantOrAppNotFoundException {
         WebAuthNSQLStorage webAuthNStorage = StorageUtils.getWebAuthNStorage(storage);
         AuthRecipeSQLStorage authRecipeStorage = StorageUtils.getAuthRecipeStorage(storage);
         try {
             webAuthNStorage.startTransaction(con -> {
 
-                String userIdFromMapping = translateToInternalUserId(storage, tenantIdentifier, userId);
+                // Resolve the internal user id on the transaction's own connection (not a second pooled
+                // connection), keeping the mapping read inside this transaction.
+                String userIdFromMapping = translateToInternalUserId(con, storage, tenantIdentifier, userId);
 
                 AuthRecipeUserInfo user = StorageUtils.getAuthRecipeStorage(storage)
                         .getPrimaryUserById_Transaction(tenantIdentifier.toAppIdentifier(), con, userIdFromMapping);
                 if (user == null) {
-                    throw new StorageTransactionLogicException(new UserIdNotFoundException());
+                    throw new StorageTransactionLogicException(new UnknownUserIdException());
                 }
                 boolean relevantLoginMethod = false;
                 for (LoginMethod lm : user.loginMethods) {
@@ -655,34 +707,15 @@ public class WebAuthN {
                     }
                 }
                 if (!relevantLoginMethod) {
-                    throw new StorageTransactionLogicException(new UserIdNotFoundException());
+                    throw new StorageTransactionLogicException(new UnknownUserIdException());
                 }
 
                 if (email != null) {
-                    if (user.isPrimaryUser) {
-                        for (String tenantId : user.tenantIds) {
-                            AuthRecipeUserInfo[] existingUsersWithNewEmail =
-                                    authRecipeStorage.listPrimaryUsersByEmail_Transaction(
-                                            tenantIdentifier.toAppIdentifier(), con,
-                                            email);
-
-                            for (AuthRecipeUserInfo userWithSameEmail : existingUsersWithNewEmail) {
-                                if (!userWithSameEmail.tenantIds.contains(tenantId)) {
-                                    continue;
-                                }
-                                if (userWithSameEmail.isPrimaryUser && !userWithSameEmail.getSupertokensUserId()
-                                        .equals(user.getSupertokensUserId())) {
-                                    throw new StorageTransactionLogicException(
-                                            new EmailChangeNotAllowedException());
-                                }
-                            }
-                        }
-                    }
-
                     try {
                         webAuthNStorage.updateUserEmail_Transaction(tenantIdentifier, con,
                                 userIdFromMapping, email);
-                    } catch (UserIdNotFoundException | DuplicateUserEmailException e) {
+                    } catch (DuplicateEmailException | EmailChangeNotAllowedException |
+                             UnknownUserIdException e) {
                         throw new StorageTransactionLogicException(e);
                     }
                 }
@@ -690,10 +723,10 @@ public class WebAuthN {
             });
         } catch (StorageTransactionLogicException e) {
             Throwable cause = e.getCause();
-            if (cause instanceof UserIdNotFoundException){
-                throw (UserIdNotFoundException) cause;
-            } else if (cause instanceof DuplicateUserEmailException) {
-                throw (DuplicateUserEmailException) cause;
+            if (cause instanceof UnknownUserIdException){
+                throw (UnknownUserIdException) cause;
+            } else if (cause instanceof DuplicateEmailException) {
+                throw (DuplicateEmailException) cause;
             } else if (cause instanceof EmailChangeNotAllowedException) {
                 throw (EmailChangeNotAllowedException) cause;
             } else if (cause instanceof TenantOrAppNotFoundException) {

@@ -6,7 +6,11 @@ import com.auth0.jwt.algorithms.Algorithm;
 import com.auth0.jwt.exceptions.JWTVerificationException;
 import com.auth0.jwt.interfaces.DecodedJWT;
 import com.auth0.jwt.interfaces.RSAKeyProvider;
-import com.google.gson.*;
+import com.google.gson.JsonArray;
+import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
+import com.google.gson.JsonPrimitive;
+import io.supertokens.authRecipe.ApproximateUserCount;
 import io.supertokens.Main;
 import io.supertokens.ProcessState;
 import io.supertokens.cronjobs.Cronjobs;
@@ -20,11 +24,7 @@ import io.supertokens.httpRequest.HttpRequest;
 import io.supertokens.httpRequest.HttpResponseException;
 import io.supertokens.multitenancy.Multitenancy;
 import io.supertokens.output.Logging;
-import io.supertokens.pluginInterface.ActiveUsersStorage;
-import io.supertokens.pluginInterface.KeyValueInfo;
-import io.supertokens.pluginInterface.STORAGE_TYPE;
-import io.supertokens.pluginInterface.Storage;
-import io.supertokens.pluginInterface.StorageUtils;
+import io.supertokens.pluginInterface.*;
 import io.supertokens.pluginInterface.authRecipe.AuthRecipeStorage;
 import io.supertokens.pluginInterface.dashboard.sqlStorage.DashboardSQLStorage;
 import io.supertokens.pluginInterface.exceptions.StorageQueryException;
@@ -42,6 +42,7 @@ import io.supertokens.version.Version;
 import org.jetbrains.annotations.TestOnly;
 
 import java.io.IOException;
+import java.util.Map;
 import java.math.BigInteger;
 import java.security.KeyFactory;
 import java.security.NoSuchAlgorithmException;
@@ -82,7 +83,11 @@ public class EEFeatureFlag implements io.supertokens.featureflag.EEFeatureFlagIn
     // works well enough anyway.
     private static final String LICENSE_KEY_IN_DB_NOT_PRESENT_VALUE = "NOT_PRESENT";
 
-    private Boolean isLicenseKeyPresent = null;
+    // Starts as FALSE ("no license key confirmed present yet") rather than null: the boot-time
+    // constructor sync that used to set this on startup now runs on the EELicenseCheck cron shortly
+    // after boot, so this can be read before the first sync. FALSE (not null) keeps getIsLicenseKeyPresent()
+    // from NPE-ing on auto-unboxing and matches the value the old boot sync produced for a key-less core.
+    private Boolean isLicenseKeyPresent = Boolean.FALSE;
 
     private long enabledFeaturesValueReadFromDbTime = -1;
     private EE_FEATURES[] enabledFeaturesFromDb = null;
@@ -106,18 +111,16 @@ public class EEFeatureFlag implements io.supertokens.featureflag.EEFeatureFlagIn
         // returns the same instance from there on.
         Cronjobs.addCronjob(main, EELicenseCheck.init(main, StorageLayer.getTenantsWithUniqueUserPoolId(main)));
 
-        try {
-            this.syncFeatureFlagWithLicenseKey();
-        } catch (HttpResponseException | IOException e) {
-            Logging.error(main, appIdentifier.getAsPublicTenantIdentifier(), "API Error during constructor sync", false,
-                    e);
-            // server request failed. we ignore for now as later on it will sync up anyway.
-        } catch (InvalidLicenseKeyException ignored) {
-            // the license key that was in the db was invalid. If this error is thrown,
-            // it means that the key was removed from the db anyway.. so we can just ignore
-            // here.
-        } catch (Throwable ignored) {
-        }
+        // No license sync here on purpose. syncFeatureFlagWithLicenseKey() does synchronous DB stats
+        // queries + an HTTPS call to api.supertokens.com; running it in this constructor meant it ran on
+        // the boot thread (before the webserver was up) and under the global resource-distributor lock on
+        // every tenant/app reload. The EELicenseCheck cron performs the initial sync shortly after boot
+        // (jittered initial delay) and daily thereafter. Feature gating is unaffected in the meantime:
+        // enabled features remain available from the DB-persisted value of the last successful sync
+        // (getEnabledEEFeaturesFromDbOrCache), and PUT /ee/license still syncs inline. The one observable
+        // difference is timing of the paid-usage stats report that verifyLicenseKey sends: an app created
+        // or updated at runtime is only added to this cron's tenant list here, so its first stats report
+        // happens on the next cron tick instead of immediately in the (now removed) constructor sync.
     }
 
     @Override
@@ -244,13 +247,22 @@ public class EEFeatureFlag implements io.supertokens.featureflag.EEFeatureFlagIn
         JsonArray tenantStats = new JsonArray();
 
         TenantConfig[] tenantConfigs = Multitenancy.getAllTenantsForApp(this.appIdentifier, main);
+        // From the user-count pipeline: each tenant's full count, shared by every core through the database, plus
+        // the lifecycle events since it. Fetched for all tenants at once, so missing counts run concurrently and
+        // every tenant is served from one event read.
+        List<TenantIdentifier> tenantIdentifiers = new ArrayList<>();
+        for (TenantConfig tenantConfig : tenantConfigs) {
+            tenantIdentifiers.add(tenantConfig.tenantIdentifier);
+        }
+        Map<String, ApproximateUserCount.ApproximateCountResult> usersCounts = ApproximateUserCount
+                .getInstance(main, this.appIdentifier).serveTenants(main, tenantIdentifiers);
         for (TenantConfig tenantConfig : tenantConfigs) {
             JsonObject tenantStat = new JsonObject();
             tenantStat.addProperty("tenantId", tenantConfig.tenantIdentifier.getTenantId());
 
             {
                 Storage storage = StorageLayer.getStorage(tenantConfig.tenantIdentifier, main);
-                long usersCount = ((AuthRecipeStorage) storage).getUsersCount(tenantConfig.tenantIdentifier, null);
+                long usersCount = usersCounts.get(tenantConfig.tenantIdentifier.getTenantId()).count;
                 boolean hasUsersOrSessions = (usersCount > 0);
                 hasUsersOrSessions = hasUsersOrSessions ||
                         ((SessionSQLStorage) storage).getNumberOfSessions(tenantConfig.tenantIdentifier) > 0;
@@ -377,12 +389,20 @@ public class EEFeatureFlag implements io.supertokens.featureflag.EEFeatureFlagIn
         JsonArray mauArr = new JsonArray();
         long now = System.currentTimeMillis();
 
-        for (int i = 1; i <= 31; i++) {
-            long timestamp = now - (i * 24 * 60 * 60 * 1000L);
-            ActiveUsersStorage activeUsersStorage = (ActiveUsersStorage) StorageLayer.getStorage(
-                    this.appIdentifier.getAsPublicTenantIdentifier(), main);
-            int mau = activeUsersStorage.countUsersActiveSince(this.appIdentifier, timestamp);
-            mauArr.add(new JsonPrimitive(mau));
+        ActiveUsersStorage activeUsersStorage = (ActiveUsersStorage) StorageLayer.getStorage(
+                this.appIdentifier.getAsPublicTenantIdentifier(), main);
+
+        // One bucketed query for the whole series instead of 31 separate COUNT(*)s, each of which
+        // scanned the app's entire user_last_active set.
+        long oldestTimestamp = now - (31L * 24 * 60 * 60 * 1000L);
+        Map<Integer, Integer> usersByDaysAgo = activeUsersStorage.countUsersActiveSinceGroupedByDay(
+                this.appIdentifier, oldestTimestamp, now);
+
+        // maus[i] == users active since (now - (i+1) days) == running total of buckets 0..i
+        int runningTotal = 0;
+        for (int day = 0; day < 31; day++) {
+            runningTotal += usersByDaysAgo.getOrDefault(day, 0);
+            mauArr.add(new JsonPrimitive(runningTotal));
         }
         return mauArr;
     }
@@ -406,8 +426,12 @@ public class EEFeatureFlag implements io.supertokens.featureflag.EEFeatureFlagIn
 
                 JsonObject stat = new JsonObject();
                 stat.addProperty("numberOfSAMLClients", samlStorage.countSAMLClients(tenantConfig.tenantIdentifier));
-                stat.add(tenantConfig.tenantIdentifier.getTenantId(), stat);
+                // was: stat.add(tenantId, stat) - added the object to itself (serialization recursion
+                // hazard) and tenantStat was never appended, so "tenants" was always empty.
+                tenantStat.add(tenantConfig.tenantIdentifier.getTenantId(), stat);
             }
+
+            tenantStats.add(tenantStat);
         }
 
         stats.add("tenants", tenantStats);
@@ -570,7 +594,8 @@ public class EEFeatureFlag implements io.supertokens.featureflag.EEFeatureFlagIn
                 });
                 return enabledFeatures.toArray(EE_FEATURES[]::new);
             } else if (licenseCheckResponse.get("status").getAsString().equalsIgnoreCase("INVALID_LICENSE_KEY")) {
-                Logging.debug(main, appIdentifier.getAsPublicTenantIdentifier(), "Invalid license key: " + licenseKey);
+                //Logging.debug(main, appIdentifier.getAsPublicTenantIdentifier(), "Invalid license key: " +
+                // licenseKey);
                 ProcessState.getInstance(main).addState(ProcessState.PROCESS_STATE.INVALID_LICENSE_KEY, null);
                 throw new InvalidLicenseKeyException();
             }
@@ -586,8 +611,8 @@ public class EEFeatureFlag implements io.supertokens.featureflag.EEFeatureFlagIn
             throws StorageQueryException, TenantOrAppNotFoundException {
         JsonArray json = new JsonArray();
         Arrays.stream(features).forEach(ee_features -> json.add(new JsonPrimitive(ee_features.toString())));
-        Logging.debug(main, appIdentifier.getAsPublicTenantIdentifier(),
-                "Saving new feature flag in database: " + json);
+        //Logging.debug(main, appIdentifier.getAsPublicTenantIdentifier(),
+        //      "Saving new feature flag in database: " + json);
         StorageLayer.getStorage(this.appIdentifier.getAsPublicTenantIdentifier(), main)
                 .setKeyValue(this.appIdentifier.getAsPublicTenantIdentifier(), FEATURE_FLAG_KEY_IN_DB,
                         new KeyValueInfo(json.toString()));
@@ -600,11 +625,11 @@ public class EEFeatureFlag implements io.supertokens.featureflag.EEFeatureFlagIn
         if (this.enabledFeaturesValueReadFromDbTime == -1
                 || (System.currentTimeMillis()
                 - this.enabledFeaturesValueReadFromDbTime > INTERVAL_BETWEEN_DB_READS)) {
-            Logging.debug(main, appIdentifier.getAsPublicTenantIdentifier(), "Reading feature flag from database");
+            //Logging.debug(main, appIdentifier.getAsPublicTenantIdentifier(), "Reading feature flag from database");
             KeyValueInfo keyValueInfo = StorageLayer.getStorage(this.appIdentifier.getAsPublicTenantIdentifier(), main)
                     .getKeyValue(this.appIdentifier.getAsPublicTenantIdentifier(), FEATURE_FLAG_KEY_IN_DB);
             if (keyValueInfo == null) {
-                Logging.debug(main, appIdentifier.getAsPublicTenantIdentifier(), "No feature flag set in db");
+                //Logging.debug(main, appIdentifier.getAsPublicTenantIdentifier(), "No feature flag set in db");
                 return new EE_FEATURES[]{};
             }
             JsonArray featuresArrayJson = new JsonParser().parse(keyValueInfo.value).getAsJsonArray();
@@ -618,20 +643,20 @@ public class EEFeatureFlag implements io.supertokens.featureflag.EEFeatureFlagIn
             this.enabledFeaturesFromDb = enabledFeatures.toArray(EE_FEATURES[]::new);
             this.enabledFeaturesValueReadFromDbTime = System.currentTimeMillis();
         } else {
-            Logging.debug(main, appIdentifier.getAsPublicTenantIdentifier(), "Returning feature flag from cache");
+            //Logging.debug(main, appIdentifier.getAsPublicTenantIdentifier(), "Returning feature flag from cache");
         }
         return this.enabledFeaturesFromDb;
     }
 
     private void setLicenseKeyInDb(String key) throws StorageQueryException, TenantOrAppNotFoundException {
-        Logging.debug(main, appIdentifier.getAsPublicTenantIdentifier(), "Setting license key in db: " + key);
+        //Logging.debug(main, appIdentifier.getAsPublicTenantIdentifier(), "Setting license key in db: " + key);
         StorageLayer.getStorage(this.appIdentifier.getAsPublicTenantIdentifier(), main)
                 .setKeyValue(this.appIdentifier.getAsPublicTenantIdentifier(), LICENSE_KEY_IN_DB,
                         new KeyValueInfo(key));
     }
 
     private void removeLicenseKeyFromDb() throws StorageQueryException, TenantOrAppNotFoundException {
-        Logging.debug(main, appIdentifier.getAsPublicTenantIdentifier(), "Removing license key from db");
+        //Logging.debug(main, appIdentifier.getAsPublicTenantIdentifier(), "Removing license key from db");
         StorageLayer.getStorage(this.appIdentifier.getAsPublicTenantIdentifier(), main)
                 .setKeyValue(this.appIdentifier.getAsPublicTenantIdentifier(), LICENSE_KEY_IN_DB,
                         new KeyValueInfo(LICENSE_KEY_IN_DB_NOT_PRESENT_VALUE));
@@ -639,14 +664,14 @@ public class EEFeatureFlag implements io.supertokens.featureflag.EEFeatureFlagIn
 
     private String getLicenseKeyInDb(TenantIdentifier tenantIdentifier)
             throws TenantOrAppNotFoundException, StorageQueryException, NoLicenseKeyFoundException {
-        Logging.debug(main, tenantIdentifier, "Attempting to fetch license key from db");
+        //Logging.debug(main, tenantIdentifier, "Attempting to fetch license key from db");
         KeyValueInfo info = StorageLayer.getStorage(tenantIdentifier, main)
                 .getKeyValue(tenantIdentifier, LICENSE_KEY_IN_DB);
         if (info == null || info.value.equals(LICENSE_KEY_IN_DB_NOT_PRESENT_VALUE)) {
-            Logging.debug(main, tenantIdentifier, "No license key found in db");
+            // Logging.debug(main, tenantIdentifier, "No license key found in db");
             throw new NoLicenseKeyFoundException();
         }
-        Logging.debug(main, tenantIdentifier, "Fetched license key from db: " + info.value);
+        //Logging.debug(main, tenantIdentifier, "Fetched license key from db: " + info.value);
         return info.value;
     }
 

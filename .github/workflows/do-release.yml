@@ -1,148 +1,521 @@
-name: Do Release
+name: Release
+run-name: Release v${{ inputs.core-version }}${{ inputs.is-canary && ' [canary]' || '' }}${{ inputs.fast-release && ' [smoke tests only]' || '' }}
 
 on:
   workflow_dispatch:
     inputs:
       core-version:
-        description: 'Core version'
+        description: 'Core version (e.g. 11.4.0)'
         required: true
         type: string
       plugin-interface-version:
-        description: 'Plugin interface version'
+        description: 'Plugin interface version (e.g. 8.4.0)'
         required: true
         type: string
-      new-release-for-plugin-interface:
-        description: 'New release for plugin interface'
-        required: true
-        type: boolean
       postgresql-plugin-version:
-        description: 'Postgres plugin version'
+        description: 'PostgreSQL plugin version (e.g. 9.4.0)'
         required: true
-      new-release-for-postgresql-plugin:
-        description: 'New release for postgres plugin'
+        type: string
+      release-plugin-interface:
+        description: 'Release a new plugin-interface version'
         required: true
         type: boolean
+        default: true
+      release-postgresql-plugin:
+        description: 'Release a new postgresql-plugin version'
+        required: true
+        type: boolean
+        default: true
       is-latest-release:
-        description: 'Is this the latest release?'
+        description: 'Is this the latest release? (tags the Docker image as "latest")'
         required: true
         type: boolean
+        default: true
+      is-latest-for-major:
+        description: 'Is this the latest release for its major version? (tags the Docker image with the major version, e.g. "9")'
+        required: true
+        type: boolean
+        default: true
+      run-stress-tests:
+        description: 'Run stress tests'
+        required: true
+        type: boolean
+        default: true
+      is-canary:
+        description: 'Is this a canary release? Cannot be combined with "latest release"'
+        required: true
+        type: boolean
+        default: false
+      fast-release:
+        description: 'Fast release: only run smoke tests (login + session tests) instead of the full suite. Cannot be combined with "latest release"'
+        required: true
+        type: boolean
+        default: false
+      force-retag:
+        description: 'Allow moving an already-published version tag to a new image digest (emergencies only)'
+        required: true
+        type: boolean
+        default: false
+      prebuilt:
+        description: 'Embargoed release: publish the image already in ECR under this version (built and tested privately) instead of building. Push the code first.'
+        required: true
+        type: boolean
+        default: false
 
 jobs:
+  # Fail fast on invalid input combinations before anything is registered
+  # or published. Every other job depends on dependency-branches, so gating
+  # it here stops the whole release.
+  validate-inputs:
+    name: Validate inputs
+    if: github.repository == 'supertokens/supertokens-core'
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Check fast-release and is-latest-release are mutually exclusive
+        if: inputs.fast-release && inputs.is-latest-release
+        run: |
+          echo "::error::A fast release (smoke tests only) must not be marked as the latest release. Untick one of the two options."
+          exit 1
+      - name: Check is-canary and is-latest-release are mutually exclusive
+        if: inputs.is-canary && inputs.is-latest-release
+        run: |
+          echo "::error::A canary release must not be marked as the latest release. Untick one of the two options."
+          exit 1
+      - name: Check prebuilt is not combined with canary or force-retag
+        if: inputs.prebuilt && (inputs.is-canary || inputs.force-retag)
+        run: |
+          echo "::error::A prebuilt (embargoed) release publishes exactly the image the fleet runs: it can't be a canary and must never force-retag."
+          exit 1
+
   dependency-branches:
-    name: Dependency Branches
-    environment: publish
-    runs-on: ubuntu-latest
-    outputs:
-      branches: ${{ steps.result.outputs.branches }}
-      versions: ${{ steps.result.outputs.versions }}
+    needs: validate-inputs
+    uses: ./.github/workflows/_release-resolve-deps.yml
+    with:
+      core-version: ${{ inputs.core-version }}
+      plugin-interface-version: ${{ inputs.plugin-interface-version }}
+      postgresql-plugin-version: ${{ inputs.postgresql-plugin-version }}
+    secrets: inherit
 
-    steps:
-      - uses: actions/checkout@v4
-      - uses: supertokens/get-core-dependencies-action@main
-        id: result
-        with:
-          run-for: add-dev-tag
-          core-version: ${{ github.event.inputs.core-version }}
-          plugin-interface-version: ${{ github.event.inputs.plugin-interface-version }}
-          postgresql-plugin-version: ${{ github.event.inputs.postgresql-plugin-version }}
-  release-docker:
-    environment: publish
-    name: Release Docker
-    runs-on: ubuntu-latest
+  # Prebuilt (embargoed) releases: the image already exists in ECR under this version, built
+  # and tested privately in supertokens-core-security. Its labels record the commits it was
+  # built from; check them against the public branches this release resolved.
+  prebuilt-image:
+    name: Load prebuilt image
     needs: dependency-branches
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v2
-      - name: Set up JDK 21.0.7
-        uses: actions/setup-java@v2
-        with:
-          java-version: 21.0.7
-          distribution: zulu
-      - name: Login to Docker Hub
-        uses: docker/login-action@v3
-        with:
-          username: ${{ vars.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-      - name: Tag and Push Docker Image
-        run: |
-          tag=${{ github.event.inputs.core-version }}
-          major=$(echo $tag | cut -d. -f1)
-          minor=$(echo $tag | cut -d. -f1,2)
-
-          bash .github/helpers/release-docker.sh supertokens/supertokens-dev-postgresql:$minor supertokens/supertokens-postgresql:$major
-          bash .github/helpers/release-docker.sh supertokens/supertokens-dev-postgresql:$minor supertokens/supertokens-postgresql:$minor
-          bash .github/helpers/release-docker.sh supertokens/supertokens-dev-postgresql:$minor supertokens/supertokens-postgresql:$tag
-
-          if [ "${{ github.event.inputs.is-latest-release }}" == "true" ]; then
-            bash .github/helpers/release-docker.sh supertokens/supertokens-dev-postgresql:$minor supertokens/supertokens-postgresql:latest
-          fi
-  add-release-tag:
+    if: inputs.prebuilt
     environment: publish
-    runs-on: ubuntu-latest
-    needs: [dependency-branches, release-docker]
+    runs-on: ubuntu-22.04
+    outputs:
+      # The digest, not image-ref: the ref contains the ECR registry (a secret), and GitHub
+      # drops job outputs that contain a secret.
+      digest: ${{ steps.manifest.outputs.digest }}
+      core-sha: ${{ steps.manifest.outputs.core-sha }}
+      plugin-interface-sha: ${{ steps.manifest.outputs.plugin-interface-sha }}
+      postgresql-sha: ${{ steps.manifest.outputs.postgresql-sha }}
+      has-db-migration: ${{ steps.manifest.outputs.has-db-migration }}
     steps:
-      - name: Set up JDK 21.0.7
-        uses: actions/setup-java@v2
+      - name: Checkout workflow sources
+        uses: actions/checkout@v5
         with:
-          java-version: 21.0.7
-          distribution: zulu
-      - uses: actions/checkout@v2
+          sparse-checkout: .github
+
+      - name: Set up crane
+        uses: ./.github/actions/setup-crane
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
         with:
-          repository: supertokens/supertokens-root
-          path: ./supertokens-root
-          ref: master
-      - name: Checkout supertokens-core
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Read image manifest
+        id: manifest
+        env:
+          REPO: ${{ secrets.ECR_REGISTRY }}/${{ vars.ECR_REPOSITORY }}
+          VERSION: ${{ inputs.core-version }}
         run: |
-          cd supertokens-root
-          git clone https://${{ secrets.GH_TOKEN }}@github.com/supertokens/supertokens-core.git
-          cd supertokens-core
-          git checkout ${{ fromJson(needs.dependency-branches.outputs.branches)['core'] }}
-      - name: Checkout supertokens-plugin-interface
+          set -euo pipefail
+          bash .github/helpers/read-image-manifest.sh "$REPO" "$VERSION" | tee -a "$GITHUB_OUTPUT"
+
+      - name: Verify against the public branches
+        env:
+          VERSION: ${{ inputs.core-version }}
+          IMAGE_VERSION: ${{ steps.manifest.outputs.core-version }}
+          IMAGE_CORE_SHA: ${{ steps.manifest.outputs.core-sha }}
+          IMAGE_PI_SHA: ${{ steps.manifest.outputs.plugin-interface-sha }}
+          IMAGE_PG_SHA: ${{ steps.manifest.outputs.postgresql-sha }}
+          TESTS_RUN_ID: ${{ steps.manifest.outputs.tests-run-id }}
+          CORE_SHA: ${{ needs.dependency-branches.outputs.core-sha }}
+          PI_SHA: ${{ needs.dependency-branches.outputs.plugin-interface-sha }}
+          PG_SHA: ${{ needs.dependency-branches.outputs.postgresql-sha }}
+          PI_REPO: supertokens/supertokens-plugin-interface
+          PG_REPO: supertokens/supertokens-postgresql-plugin
+        run: bash .github/helpers/verify-prebuilt-image.sh
+
+  # The commits this release is about: the resolved branch heads, or for a prebuilt release
+  # the commits the image was built from (verified above). Everything downstream uses these.
+  release-shas:
+    name: Release commits
+    needs: [ dependency-branches, prebuilt-image ]
+    if: ${{ github.repository == 'supertokens/supertokens-core' && !cancelled() && !failure() }}
+    runs-on: ubuntu-22.04
+    outputs:
+      core-sha: ${{ inputs.prebuilt && needs.prebuilt-image.outputs.core-sha || needs.dependency-branches.outputs.core-sha }}
+      plugin-interface-sha: ${{ inputs.prebuilt && needs.prebuilt-image.outputs.plugin-interface-sha || needs.dependency-branches.outputs.plugin-interface-sha }}
+      postgresql-sha: ${{ inputs.prebuilt && needs.prebuilt-image.outputs.postgresql-sha || needs.dependency-branches.outputs.postgresql-sha }}
+    steps:
+      - name: Record
+        env:
+          MODE: ${{ inputs.prebuilt && 'prebuilt image' || 'resolved branches' }}
+        run: echo "Release commits come from the $MODE."
+
+  # Derives has-db-migration from the postgresql plugin's migration manifest
+  # (single source of truth) and fails the release early if the core CHANGELOG
+  # doesn't document the migration. Shared with do-release-java15.yml via the
+  # reusable workflow. register-versions waits on this job, so a failure stops
+  # the release before anything is registered.
+  derive-db-migration-flag:
+    name: Derive has-db-migration from migration manifest
+    needs: release-shas
+    # Every job after release-shas states its condition on its needs' results: without one,
+    # GitHub skips a job when any upstream job was skipped, and prebuilt-image is skipped on
+    # every non-prebuilt release - which skipped the build and the tests while mark-as-passed
+    # (!failure()) still ran.
+    if: ${{ !cancelled() && needs.release-shas.result == 'success' }}
+    uses: ./.github/workflows/_release-derive-db-migration.yml
+    with:
+      core-version: ${{ inputs.core-version }}
+      postgresql-plugin-version: ${{ inputs.postgresql-plugin-version }}
+      core-sha: ${{ needs.release-shas.outputs.core-sha }}
+      postgresql-sha: ${{ needs.release-shas.outputs.postgresql-sha }}
+    secrets: inherit
+
+  register-versions:
+    needs: [ release-shas, derive-db-migration-flag ]
+    if: ${{ !cancelled() && needs.derive-db-migration-flag.result == 'success' }}
+    uses: ./.github/workflows/_release-register-versions.yml
+    with:
+      core-version: ${{ inputs.core-version }}
+      core-sha: ${{ needs.release-shas.outputs.core-sha }}
+      postgresql-plugin-version: ${{ inputs.postgresql-plugin-version }}
+      postgresql-sha: ${{ needs.release-shas.outputs.postgresql-sha }}
+      release-postgresql-plugin: ${{ inputs.release-postgresql-plugin }}
+      is-canary: ${{ inputs.is-canary }}
+    secrets: inherit
+
+  test:
+    # A prebuilt image was tested privately on exactly these commits (see its tests-run-id).
+    if: ${{ !inputs.prebuilt && !cancelled() && needs.register-versions.result == 'success' }}
+    needs: [ release-shas, register-versions ]
+    uses: ./.github/workflows/_release-run-tests.yml
+    with:
+      core-sha: ${{ needs.release-shas.outputs.core-sha }}
+      plugin-interface-sha: ${{ needs.release-shas.outputs.plugin-interface-sha }}
+      postgresql-sha: ${{ needs.release-shas.outputs.postgresql-sha }}
+      fast-release: ${{ inputs.fast-release }}
+    secrets: inherit
+
+  # Prebuilt: the migration flag derived here (from the same plugin commit) must match the
+  # one recorded when the image was built.
+  prebuilt-consistency:
+    name: Check prebuilt migration flag
+    needs: [ prebuilt-image, derive-db-migration-flag ]
+    if: ${{ inputs.prebuilt && !cancelled() && needs.prebuilt-image.result == 'success' && needs.derive-db-migration-flag.result == 'success' }}
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Compare has-db-migration
+        env:
+          DERIVED: ${{ needs.derive-db-migration-flag.outputs.has-db-migration }}
+          RECORDED: ${{ needs.prebuilt-image.outputs.has-db-migration }}
         run: |
-          cd supertokens-root
-          git clone https://${{ secrets.GH_TOKEN }}@github.com/supertokens/supertokens-plugin-interface.git
-          cd supertokens-plugin-interface
-          git checkout ${{ fromJson(needs.dependency-branches.outputs.branches)['plugin-interface'] }}
+          if [ "$DERIVED" != "$RECORDED" ]; then
+            echo "::error::has-db-migration is '$DERIVED' here but the image recorded '$RECORDED'"
+            exit 1
+          fi
+
+  mark-as-passed:
+    needs: [ register-versions, test, derive-db-migration-flag, prebuilt-consistency ]
+    # Only after the tests passed (or, for a prebuilt image, its consistency check): a release is
+    # never marked as passed with its tests skipped.
+    if: >-
+      ${{ github.repository == 'supertokens/supertokens-core' && !cancelled() && !failure()
+      && needs.register-versions.result == 'success'
+      && ((!inputs.prebuilt && needs.test.result == 'success')
+      || (inputs.prebuilt && needs.prebuilt-consistency.result == 'success')) }}
+    uses: ./.github/workflows/_release-mark-passed.yml
+    with:
+      core-version: ${{ inputs.core-version }}
+      postgresql-plugin-version: ${{ inputs.postgresql-plugin-version }}
+      release-postgresql-plugin: ${{ inputs.release-postgresql-plugin }}
+      is-canary: ${{ inputs.is-canary }}
+      has-db-migration: ${{ needs.derive-db-migration-flag.outputs.has-db-migration == 'true' }}
+    secrets: inherit
+
+  # When this release ships a DB migration, open a PR against
+  # supertokens-backend-apis that adds it to the CORE_MIGRATIONS registry —
+  # the change the SaaS rollout guard waits for. Plain-SQL migrations are
+  # code-generated from the plugin's canonical script
+  # (scripts/generate-core-migration.mjs in backend-apis - plain transactional
+  # scripts and CREATE/DROP INDEX CONCURRENTLY-only patch scripts); `custom: true`
+  # migrations get a PENDING doc instead, because generated code cannot
+  # faithfully represent arbitrary multi-step migrations and a
+  # guard-satisfying-but-wrong entry is worse than a blocking one. Everything
+  # is keyed by the full core X.Y.Z (patch releases can ship index-only
+  # migrations too). Skipped when the registry already has the version or the
+  # PR branch already exists, so re-releases stay idempotent. continue-on-error: PR creation must never
+  # fail the release — the rollout guard + pending marker + Slack reminder
+  # still cover the case where this job breaks.
+  open-backend-apis-migration-pr:
+    name: Open backend-apis migration PR
+    needs: [ release-shas, derive-db-migration-flag, mark-as-passed ]
+    # Runs on canary releases too (by design): the core-version input and the
+    # resolved postgresql-sha are identical for a canary and its real release
+    # (canary only appends -canary to the *tag*), so a PR opened during canary
+    # is keyed to the correct core-version and carries the correct migration
+    # script. The registry-exists and branch-exists guards below then make the
+    # later real release find that PR already open and idempotently skip — so
+    # the migration PR simply lands earlier (at canary time) rather than being
+    # duplicated. This deliberately does NOT mirror the !inputs.is-canary
+    # exclusions on build-jars / the Tag core step: opening the backend-apis PR
+    # early is safe and desirable, whereas publishing artifacts/tags is not.
+    if: ${{ github.repository == 'supertokens/supertokens-core' && !cancelled() && !failure() && needs.derive-db-migration-flag.outputs.has-db-migration == 'true' }}
+    continue-on-error: true
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout supertokens-backend-apis
+        uses: actions/checkout@v5
+        with:
+          repository: supertokens/supertokens-backend-apis
+          # dev is the integration branch backend-apis PRs target; it now
+          # carries the migration-awareness companion (generate-core-migration.mjs
+          # + the CORE_MIGRATIONS registry), which it lacked during the 12.2.0
+          # release (the temporary master fallback).
+          ref: dev
+          # Org-level secret with access to supertokens-backend-apis; GH_TOKEN
+          # has no grant for that repo. Also persisted by checkout for the
+          # git push below.
+          token: ${{ secrets.BACKEND_APIS_PR_KEY }}
+          path: backend-apis
       - name: Checkout supertokens-postgresql-plugin
+        uses: actions/checkout@v5
+        with:
+          repository: supertokens/supertokens-postgresql-plugin
+          ref: ${{ needs.release-shas.outputs.postgresql-sha }}
+          token: ${{ secrets.GH_TOKEN }}
+          path: plugin
+      - name: Generate migration and open PR
+        env:
+          # gh pr create targets supertokens-backend-apis, so it needs the
+          # same org-level key as the checkout above, not GH_TOKEN.
+          GH_TOKEN: ${{ secrets.BACKEND_APIS_PR_KEY }}
+          # Passed via env (not expanded into the shell) so the release inputs
+          # can't inject GitHub-Actions expressions into this run block.
+          CORE_VERSION: ${{ inputs.core-version }}
+          PLUGIN_VERSION: ${{ inputs.postgresql-plugin-version }}
+          # The SQL script is the migration's source of truth: consume it from
+          # the derive job's output rather than re-deriving it from the manifest
+          # here, so the two jobs can't disagree on which script this release
+          # ships. custom/notes below are secondary metadata read once.
+          SQL_FILE: ${{ needs.derive-db-migration-flag.outputs.sql-file }}
         run: |
-          cd supertokens-root
-          git clone https://${{ secrets.GH_TOKEN }}@github.com/supertokens/supertokens-postgresql-plugin.git
-          cd supertokens-postgresql-plugin
-          git checkout ${{ fromJson(needs.dependency-branches.outputs.branches)['postgresql'] }}
-      - name: Add release password
+          coreVersion="$CORE_VERSION"
+          pluginVersion="$PLUGIN_VERSION"
+          sqlfile="$SQL_FILE"
+          entry=$(jq --arg v "$pluginVersion" '.migrations[] | select(.pluginVersion == $v)' plugin/migration-scripts/manifest.json)
+          custom=$(echo "$entry" | jq -r '.custom // false')
+          isPatch=$([ "$(echo "$coreVersion" | cut -d. -f3)" != "0" ] && echo true || echo false)
+          notes=$(echo "$entry" | jq -r '.notes // ""')
+          # has-db-migration == 'true' already gated this job, so the derive job
+          # must have emitted a sql-file; treat an empty one as a contract
+          # violation rather than silently generating an empty PR.
+          if [ -z "$sqlfile" ]; then
+            echo "::error::has-db-migration was true but the derive job produced no sql-file for plugin $pluginVersion - cannot generate the backend-apis PR."
+            exit 1
+          fi
+          cd backend-apis
+          registry=apps/backend-api/ts/helpers/multi-tenancy/rds/migration/index.ts
+          if grep -q "version: \"$coreVersion\"" "$registry"; then
+            echo "::notice::backend-apis CORE_MIGRATIONS already contains $coreVersion - no PR needed."
+            exit 0
+          fi
+          branch="core-migration/v$coreVersion"
+          if git ls-remote --exit-code origin "refs/heads/$branch" > /dev/null 2>&1; then
+            echo "::notice::Branch $branch already exists on supertokens-backend-apis (PR presumably open) - skipping."
+            exit 0
+          fi
+          git config user.name "supertokens-release-bot"
+          git config user.email "team@supertokens.com"
+          git checkout -b "$branch"
+          suffix=${coreVersion//./_}
+          if [ "$custom" = "true" ]; then
+            dest=apps/backend-api/ts/helpers/multi-tenancy/rds/migration/PENDING-$coreVersion.md
+            {
+              echo "# PENDING: core $coreVersion DB migration (custom)"
+              echo
+              echo "Core $coreVersion was released with a DB migration that is marked custom in the"
+              echo "postgresql plugin's migration manifest, so it cannot be code-generated:"
+              echo "implement migrateTo$suffix in queries.ts by hand (multi-step /"
+              echo "CONCURRENTLY handling - see the script comments), add the migrateDBTo$suffix"
+              echo "wrapper and the CORE_MIGRATIONS entry in index.ts, and delete this file."
+              echo "Until the entry exists, the SaaS rollout of core $coreVersion stays deferred"
+              echo "(saas_rollout_pending) - that is intentional."
+              if [ "$isPatch" = "true" ]; then
+                echo
+                echo "This is a patch-release migration (index add/drop only by rule; the core also does"
+                echo "it itself at boot), so the SaaS-side implementation only has to be idempotent and"
+                echo "is there for the teleport chain (CONCURRENTLY there too)."
+              fi
+              echo
+              echo "Manifest notes: $notes"
+              echo
+              echo "Canonical SQL (supertokens-postgresql-plugin/migration-scripts/$sqlfile):"
+              echo
+              echo '```sql'
+              cat "../plugin/migration-scripts/$sqlfile"
+              echo '```'
+            } > "$dest"
+            title="core $coreVersion: implement custom DB migration (PENDING)"
+          else
+            node apps/backend-api/scripts/generate-core-migration.mjs "$coreVersion" "../plugin/migration-scripts/$sqlfile"
+            title="core $coreVersion: add DB migration to CORE_MIGRATIONS"
+          fi
+          git add -A
+          git commit -m "feat: add core $coreVersion DB migration (from plugin v$pluginVersion release)"
+          git push origin "$branch"
+          # Build the body in a file and pass --body-file: a here-block keeps the
+          # continuation lines at column 0 so GitHub-flavored markdown doesn't
+          # treat the indented run-block text as a code block (which would kill
+          # the review checklist's checkboxes).
+          bodyFile="$(mktemp)"
+          {
+            echo "Auto-generated by the supertokens-core release workflow for core $coreVersion (postgresql-plugin $pluginVersion)."
+            echo
+            echo "Source of truth: supertokens-postgresql-plugin/migration-scripts/$sqlfile (manifest entry pluginVersion $pluginVersion$([ "$isPatch" = "true" ] && echo ", patch release: index-only, CONCURRENTLY"))."
+            echo "Manifest notes: $notes"
+            echo
+            echo "Until this is merged AND deployed, the SaaS (ECS) rollout of core $coreVersion stays deferred (core_version_metadata.saas_rollout_pending; a Slack reminder repeats every 6h). After deploying, trigger the rollout via POST /manual/multi-tenancy/core/release."
+            echo
+            echo "Review checklist:"
+            echo "- [ ] SQL matches the plugin release's schema change (the plugin's schema-migration-check CI verified the script against a real schema diff at PR time)"
+            echo "- [ ] CI green (coreMigrationsRegistry.test.ts validates registry ordering)"
+            echo "- [ ] Deploy backend-apis, then trigger the SaaS rollout"
+            echo
+            echo "Workflow run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          } > "$bodyFile"
+          gh pr create --repo supertokens/supertokens-backend-apis --base dev --head "$branch" \
+            --title "$title" \
+            --body-file "$bodyFile"
+
+  # Builds once into the dev repo; stress tests and promotion then use that exact digest.
+  build-docker:
+    if: ${{ !inputs.prebuilt && !cancelled() && needs.derive-db-migration-flag.result == 'success' }}
+    needs: [ release-shas, derive-db-migration-flag ]
+    uses: ./.github/workflows/_image-build.yml
+    with:
+      core-version: ${{ inputs.core-version }}
+      is-canary: ${{ inputs.is-canary }}
+      core-sha: ${{ needs.release-shas.outputs.core-sha }}
+      plugin-interface-sha: ${{ needs.release-shas.outputs.plugin-interface-sha }}
+      postgresql-sha: ${{ needs.release-shas.outputs.postgresql-sha }}
+      target: dockerhub-dev
+      has-db-migration: ${{ needs.derive-db-migration-flag.outputs.has-db-migration }}
+    secrets: inherit
+
+  stress-tests:
+    if: ${{ inputs.run-stress-tests && !inputs.prebuilt && !cancelled() && needs.build-docker.result == 'success' }}
+    needs: [ build-docker ]
+    uses: ./.github/workflows/stress-tests.yml
+    with:
+      image: ${{ needs.build-docker.outputs.image-ref }}
+
+  release-docker:
+    needs: [ build-docker, stress-tests, mark-as-passed, prebuilt-image ]
+    # Only with an image to promote: the one built here, or the prebuilt one.
+    if: >-
+      ${{ github.repository == 'supertokens/supertokens-core' && !cancelled() && !failure()
+      && needs.mark-as-passed.result == 'success'
+      && ((!inputs.prebuilt && needs.build-docker.result == 'success')
+      || (inputs.prebuilt && needs.prebuilt-image.result == 'success')) }}
+    uses: ./.github/workflows/_image-promote.yml
+    with:
+      # Prebuilt: the version tag already exists in ECR on this digest, so ECR is a no-op check
+      # plus floating tags, and Docker Hub gets exactly the image the fleet runs.
+      source-image: ${{ !inputs.prebuilt && needs.build-docker.outputs.image-ref || '' }}
+      source-ecr-digest: ${{ inputs.prebuilt && needs.prebuilt-image.outputs.digest || '' }}
+      core-version: ${{ inputs.core-version }}
+      is-canary: ${{ inputs.is-canary }}
+      is-latest-release: ${{ inputs.is-latest-release }}
+      is-latest-for-major: ${{ inputs.is-latest-for-major }}
+      force-retag: ${{ inputs.force-retag }}
+    secrets: inherit
+
+  add-release-tags:
+    needs: [release-shas, release-docker, derive-db-migration-flag]
+    if: ${{ github.repository == 'supertokens/supertokens-core' && !cancelled() && !failure() && needs.release-docker.result == 'success' }}
+    uses: ./.github/workflows/_release-add-tags.yml
+    with:
+      core-version: ${{ inputs.core-version }}
+      plugin-interface-version: ${{ inputs.plugin-interface-version }}
+      postgresql-plugin-version: ${{ inputs.postgresql-plugin-version }}
+      core-sha: ${{ needs.release-shas.outputs.core-sha }}
+      plugin-interface-sha: ${{ needs.release-shas.outputs.plugin-interface-sha }}
+      postgresql-sha: ${{ needs.release-shas.outputs.postgresql-sha }}
+      release-plugin-interface: ${{ inputs.release-plugin-interface }}
+      release-postgresql-plugin: ${{ inputs.release-postgresql-plugin }}
+      is-canary: ${{ inputs.is-canary }}
+      is-latest-release: ${{ inputs.is-latest-release }}
+      has-db-migration: ${{ needs.derive-db-migration-flag.outputs.has-db-migration == 'true' }}
+    secrets: inherit
+
+  build-jars:
+    needs: [add-release-tags]
+    if: ${{ github.repository == 'supertokens/supertokens-core' && !cancelled() && !failure() && !inputs.is-canary && needs.add-release-tags.result == 'success' }}
+    uses: ./.github/workflows/generate-jars.yml
+    with:
+      core-version: ${{ inputs.core-version }}
+      plugin-interface-version: ${{ inputs.plugin-interface-version }}
+      postgresql-plugin-version: ${{ inputs.postgresql-plugin-version }}
+      commit-to-github: true
+    secrets: inherit
+
+  # build-jars is skipped for canary releases; !failure() lets the
+  # notification still fire in that case.
+  notify-slack:
+    name: Notify Slack
+    needs: [ add-release-tags, build-jars ]
+    if: ${{ github.repository == 'supertokens/supertokens-core' && !cancelled() && !failure() && needs.add-release-tags.result == 'success' }}
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Post release notification on Slack channel
+        id: slack-notify
+        # The release itself succeeded at this point — a failed notification
+        # must not fail the workflow. The step below leaves a memo instead.
+        continue-on-error: true
+        uses: slackapi/slack-github-action@v3
+        with:
+          method: chat.postMessage
+          token: ${{ secrets.SLACK_BOT_TOKEN }}
+          payload: |
+            channel: ${{ secrets.SLACK_RELEASE_CHANNEL_ID }}
+            text: "SuperTokens core v${{ inputs.core-version }} released${{ inputs.is-canary && ' (canary)' || '' }}"
+            blocks:
+              - type: "header"
+                text:
+                  type: "plain_text"
+                  text: "🚀 SuperTokens core v${{ inputs.core-version }} released${{ inputs.is-canary && ' — canary' || '' }}${{ inputs.fast-release && ' — smoke tests only' || '' }}"
+              - type: "section"
+                text:
+                  type: "mrkdwn"
+                  text: "*Core:* v${{ inputs.core-version }}\n*Plugin interface:* v${{ inputs.plugin-interface-version }}${{ !inputs.release-plugin-interface && ' (not released in this run)' || '' }}\n*PostgreSQL plugin:* v${{ inputs.postgresql-plugin-version }}${{ !inputs.release-postgresql-plugin && ' (not released in this run)' || '' }}\n*Docker `latest` tag:* ${{ inputs.is-latest-release && 'yes' || 'no' }}\n<${{ github.server_url }}/${{ github.repository }}/releases/tag/v${{ inputs.core-version }}${{ inputs.is-canary && '-canary' || '' }}|GitHub release> · <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|Workflow run>"
+
+      - name: Memo failed Slack notification
+        if: steps.slack-notify.outcome == 'failure'
         run: |
-          cd supertokens-root
-          echo "${{ secrets.SUPERTOKENS_API_KEY }}" > releasePassword
-          echo "${{ secrets.SUPERTOKENS_API_KEY }}" > apiPassword
-      - name: Load Modules
-        run: |
-          cd supertokens-root
-          echo "core,master
-          plugin-interface,master
-          postgresql-plugin,master
-          " > modules.txt
-          cat modules.txt
-          ./loadModules
-      - name: Setup test env
-        run: cd supertokens-root && ./utils/setupTestEnv --local
-      - name: Git config
-        run: |
-          git config --global user.name "Supertokens Bot"
-          git config --global user.email "<>"
-      - name: Add release tag to plugin interface
-        if: ${{ github.event.inputs.new-release-for-plugin-interface == 'true' }}
-        run: |
-          echo "Adding release tag to plugin interface"
-          cd supertokens-root/supertokens-plugin-interface
-          ./addReleaseTag
-      - name: Add release tag to postgres plugin
-        if: ${{ github.event.inputs.new-release-for-postgresql-plugin == 'true' }}
-        run: |
-          echo "Adding release tag to postgres plugin"
-          cd supertokens-root/supertokens-postgresql-plugin
-          ./addReleaseTag
-      - name: Add release tag to core
-        run: |
-          echo "Adding release tag to core"
-          cd supertokens-root/supertokens-core
-          ./addReleaseTag
+          echo "## ⚠️ Slack notification failed" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "The release itself completed successfully, but the announcement could not be posted to Slack." >> "$GITHUB_STEP_SUMMARY"
+          echo "Check the \`SLACK_BOT_TOKEN\` and \`SLACK_RELEASE_CHANNEL_ID\` secrets, and make sure the bot is invited to the channel." >> "$GITHUB_STEP_SUMMARY"

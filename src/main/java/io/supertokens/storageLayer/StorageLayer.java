@@ -27,9 +27,10 @@ import io.supertokens.pluginInterface.LOG_LEVEL;
 import io.supertokens.pluginInterface.STORAGE_TYPE;
 import io.supertokens.pluginInterface.Storage;
 import io.supertokens.pluginInterface.authRecipe.AuthRecipeStorage;
-import io.supertokens.pluginInterface.emailpassword.exceptions.UnknownUserIdException;
+import io.supertokens.pluginInterface.authRecipe.exceptions.UnknownUserIdException;
 import io.supertokens.pluginInterface.exceptions.DbInitException;
 import io.supertokens.pluginInterface.exceptions.InvalidConfigException;
+import io.supertokens.pluginInterface.exceptions.SchemaMismatchException;
 import io.supertokens.pluginInterface.exceptions.StorageQueryException;
 import io.supertokens.pluginInterface.multitenancy.AppIdentifier;
 import io.supertokens.pluginInterface.multitenancy.MultitenancyStorage;
@@ -49,8 +50,18 @@ import java.net.MalformedURLException;
 import java.net.URL;
 import java.net.URLClassLoader;
 import java.util.*;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLongArray;
 
-@WithinOtelSpan
+
 public class StorageLayer extends ResourceDistributor.SingletonResource {
 
     public static final String RESOURCE_KEY = "io.supertokens.storageLayer.StorageLayer";
@@ -63,11 +74,7 @@ public class StorageLayer extends ResourceDistributor.SingletonResource {
     }
 
     public static Storage getNewStorageInstance(Main main, JsonObject config, TenantIdentifier tenantIdentifier, boolean doNotLog) throws InvalidConfigException {
-        return getNewInstance(main, config, tenantIdentifier, doNotLog, false);
-    }
-
-    public static Storage getNewBulkImportProxyStorageInstance(Main main, JsonObject config, TenantIdentifier tenantIdentifier, boolean doNotLog) throws InvalidConfigException {
-        return getNewInstance(main, config, tenantIdentifier, doNotLog, true);
+        return getNewInstance(main, config, tenantIdentifier, doNotLog);
     }
 
     public static void updateConfigJsonFromEnv(Main main, JsonObject configJson) {
@@ -101,7 +108,8 @@ public class StorageLayer extends ResourceDistributor.SingletonResource {
         storageInstanceForEnv.updateConfigJsonFromEnv(configJson);
     }
 
-    private static Storage getNewInstance(Main main, JsonObject config, TenantIdentifier tenantIdentifier, boolean doNotLog, boolean isBulkImportProxy) throws InvalidConfigException {
+    @WithinOtelSpan
+    private static Storage getNewInstance(Main main, JsonObject config, TenantIdentifier tenantIdentifier, boolean doNotLog) throws InvalidConfigException {
         Storage result;
         if (StorageLayer.ucl == null) {
             result = new Start(main);
@@ -121,15 +129,8 @@ public class StorageLayer extends ResourceDistributor.SingletonResource {
             }
             if (storageLayer != null && !main.isForceInMemoryDB()
                     && (storageLayer. canBeUsed(config) || CLIOptions.get(main).isForceNoInMemoryDB())) {
-                if (isBulkImportProxy) {
-                    result = storageLayer.createBulkImportProxyStorageInstance();
-                } else {
-                    result = storageLayer;
-                }
+                result = storageLayer;
             } else {
-                if (isBulkImportProxy) {
-                    throw new QuitProgramException("Creating a bulk import proxy storage instance with in-memory DB is not supported.");
-                }
                 result = new Start(main);
             }
         }
@@ -284,6 +285,9 @@ public class StorageLayer extends ResourceDistributor.SingletonResource {
         // at this point, we have made sure that all the configs are fine and that the storage
         // objects are shared across tenants based on the config of each tenant.
 
+        // Populated inside the lock (fast — no I/O), then consumed after the lock is released.
+        Map<Storage, Set<TenantIdentifier>> storagesToInit = new HashMap<>();
+
         // now we loop through existing storage objects in the main resource distributor and reuse them
         // if the unique ID is the same as the storage objects created above.
         try {
@@ -333,42 +337,15 @@ public class StorageLayer extends ResourceDistributor.SingletonResource {
                     }
                 }
 
-                // we call init on all the newly saved storage objects.
+                // Build storage → tenants map while holding the lock (no I/O).
+                // initStorage() involves network connections and DDL; those run after
+                // the lock is released via initStoragesInParallel().
                 Map<ResourceDistributor.KeyClass, ResourceDistributor.SingletonResource> resources =
                         main.getResourceDistributor()
                                 .getAllResourcesWithResourceKey(RESOURCE_KEY);
-
-                // we are creating this map to find tenantIdentifiers that are associated with each storage.
-                // when we call the initStorage, the storage instance remembers the tenants that need to be created
-                // in case error happens. Whenever the connection is restored, the tenant entries are created on that
-                // storage. If the storage is already live, then it will be a no-op.
-                Map<Storage, Set<TenantIdentifier>> storageToTenantIdentifiersMap = new HashMap<>();
-                // Set tenant identifiers handled by each storage instance before initialising them
                 for (ResourceDistributor.KeyClass key : resources.keySet()) {
-                    if (storageToTenantIdentifiersMap.get(((StorageLayer) resources.get(key)).storage) == null) {
-                        storageToTenantIdentifiersMap.put(((StorageLayer) resources.get(key)).storage, new HashSet<>());
-                    }
-                    storageToTenantIdentifiersMap.get(((StorageLayer) resources.get(key)).storage)
-                            .add(key.getTenantIdentifier());
-                }
-
-                for (ResourceDistributor.KeyClass key : resources.keySet()) {
-                    ResourceDistributor.SingletonResource resource = resources.get(key);
-
-                    try {
-                        ((StorageLayer) resource).storage.initStorage(false,
-                                new ArrayList<>(storageToTenantIdentifiersMap.get(((StorageLayer) resource).storage)));
-                        ((StorageLayer) resource).storage.initFileLogging(
-                                Config.getBaseConfig(main).getInfoLogPath(main),
-                                Config.getBaseConfig(main).getErrorLogPath(main),
-                                TelemetryProvider.getInstance(main));
-                    } catch (DbInitException e) {
-
-                        Logging.error(main, TenantIdentifier.BASE_TENANT, e.getMessage(), false, e);
-                        // we ignore any exceptions from db here cause it's not the base tenant's db that
-                        // would throw and only tenants belonging to a specific tenant / app. In this case,
-                        // we still want other tenants to continue to work
-                    }
+                    Storage s = ((StorageLayer) resources.get(key)).storage;
+                    storagesToInit.computeIfAbsent(s, k -> new HashSet<>()).add(key.getTenantIdentifier());
                 }
 
                 return null;
@@ -378,6 +355,81 @@ public class StorageLayer extends ResourceDistributor.SingletonResource {
         } catch (ResourceDistributor.FuncException e) {
             throw new RuntimeException(e);
         }
+
+        // Connect every pool concurrently now that the ResourceDistributor lock is released.
+        initStoragesInParallel(main, storagesToInit);
+    }
+
+    /**
+     * Loads StorageLayer resources only for the specified changed tenants, without clearing
+     * and rebuilding all storage resources. Reuses existing storage instances when the
+     * userPoolId + connectionPoolId match.
+     */
+    public static void loadStorageForChangedTenants(Main main, TenantConfig[] allTenants,
+                                                     List<TenantIdentifier> tenantsThatChanged)
+            throws InvalidConfigException, IOException {
+        if (tenantsThatChanged == null || tenantsThatChanged.isEmpty()) {
+            return;
+        }
+
+        JsonObject baseConfig = Config.getBaseConfigAsJsonObject(main);
+        Map<Storage, Set<TenantIdentifier>> storagesToInit = new HashMap<>();
+
+        try {
+            main.getResourceDistributor().withResourceDistributorLock(() -> {
+                // Build existing pool ID → storage mapping from current resources
+                Map<ResourceDistributor.KeyClass, ResourceDistributor.SingletonResource> existingStorageMap =
+                        main.getResourceDistributor().getAllResourcesWithResourceKey(RESOURCE_KEY);
+                Map<String, Storage> existingPoolToStorage = new HashMap<>();
+                for (ResourceDistributor.SingletonResource resource : existingStorageMap.values()) {
+                    Storage s = ((StorageLayer) resource).storage;
+                    String uniqueId = s.getUserPoolId() + "~" + s.getConnectionPoolId();
+                    existingPoolToStorage.putIfAbsent(uniqueId, s);
+                }
+
+                for (TenantIdentifier changed : tenantsThatChanged) {
+                    try {
+                        JsonObject normConfig = Config.getNormalisedConfigForTenant(
+                                changed, allTenants, baseConfig);
+                        Storage newStorage = getNewStorageInstance(main, normConfig, changed, true);
+                        String userPoolId = newStorage.getUserPoolId();
+                        String connectionPoolId = newStorage.getConnectionPoolId();
+                        String uniqueId = userPoolId + "~" + connectionPoolId;
+
+                        // Reuse existing storage if same pool exists
+                        Storage storageToUse;
+                        boolean isNewPool;
+                        if (existingPoolToStorage.containsKey(uniqueId)) {
+                            storageToUse = existingPoolToStorage.get(uniqueId);
+                            isNewPool = false;
+                        } else {
+                            storageToUse = newStorage;
+                            isNewPool = true;
+                        }
+
+                        storageToUse.setLogLevels(Config.getBaseConfig(main).getLogLevels(main));
+
+                        // Remove old resource for this tenant (if any), then set new
+                        main.getResourceDistributor().removeResource(changed, RESOURCE_KEY);
+                        main.getResourceDistributor().setResource(changed, RESOURCE_KEY,
+                                new StorageLayer(storageToUse));
+
+                        // Defer initStorage() to after the lock — it involves TCP + DDL.
+                        if (isNewPool) {
+                            storagesToInit.computeIfAbsent(storageToUse, k -> new HashSet<>()).add(changed);
+                            existingPoolToStorage.put(uniqueId, storageToUse);
+                        }
+                    } catch (Exception e) {
+                        Logging.error(main, TenantIdentifier.BASE_TENANT, e.getMessage(), false, e);
+                    }
+                }
+                return null;
+            });
+        } catch (ResourceDistributor.FuncException e) {
+            throw new RuntimeException(e);
+        }
+
+        initStoragesInParallel(main, storagesToInit);
     }
 
     public static Storage getBaseStorage(Main main) {
@@ -388,7 +440,6 @@ public class StorageLayer extends ResourceDistributor.SingletonResource {
         }
     }
 
-    @WithinOtelSpan
     public static Storage getStorage(TenantIdentifier tenantIdentifier, Main main)
             throws TenantOrAppNotFoundException {
         return getInstance(tenantIdentifier, main).storage;
@@ -637,15 +688,23 @@ public class StorageLayer extends ResourceDistributor.SingletonResource {
         List<StorageAndUserIdMapping> allMappingsFromAllStorages = new ArrayList<>();
         if (userIdType != UserIdType.ANY) {
             for (Storage storage : storages) {
-                List<String> existingIdsInStorage = ((AuthRecipeStorage)storage).findExistingUserIds(appIdentifier, userIds);
                 List<UserIdMapping> mappingsFromThisStorage = io.supertokens.useridmapping.UserIdMapping.getMultipleUserIdMapping(
                         appIdentifier, storage,
                         userIds, userIdType);
 
+                if (userIdType == UserIdType.EXTERNAL) {
+                    for (UserIdMapping mapping : mappingsFromThisStorage) {
+                        allMappingsFromAllStorages.add(new StorageAndUserIdMappingForBulkImport(storage, mapping,
+                                mapping.externalUserId));
+                    }
+                    continue;
+                }
+
+                List<String> existingIdsInStorage = ((AuthRecipeStorage) storage).findExistingUserIds(appIdentifier,
+                        userIds);
                 for(String existingId : existingIdsInStorage) {
                     UserIdMapping mappingForId = mappingsFromThisStorage.stream()
-                                .filter(userIdMapping -> (userIdType == UserIdType.SUPERTOKENS && userIdMapping.superTokensUserId.equals(existingId))
-                                        || (userIdType == UserIdType.EXTERNAL && userIdMapping.externalUserId.equals(existingId)) )
+                                .filter(userIdMapping -> userIdMapping.superTokensUserId.equals(existingId))
                                 .findFirst().orElse(null);
                     allMappingsFromAllStorages.add(new StorageAndUserIdMappingForBulkImport(storage, mappingForId, existingId));
                 }
@@ -654,6 +713,361 @@ public class StorageLayer extends ResourceDistributor.SingletonResource {
             throw new IllegalStateException("UserIdType.ANY is not supported for this method");
         }
         return allMappingsFromAllStorages;
+    }
+
+    /** How often (seconds) the storages still initialising are reported while boot waits for them. */
+    static final long STORAGE_INIT_PROGRESS_LOG_INTERVAL_SECONDS = 60;
+
+    /** Marks a storage whose init task has not started yet in the start times {@link #awaitStorageInit} reads. */
+    static final long STORAGE_INIT_NOT_STARTED = Long.MIN_VALUE;
+
+    /**
+     * The storages whose init task {@link #initStoragesInParallel} has submitted and that have not finished it yet
+     * (queued, still initialising, or a straggler boot continued past). Compared by identity: no storage overrides
+     * equals.
+     */
+    private static final Set<Storage> STORAGES_STILL_INITIALISING = ConcurrentHashMap.newKeySet();
+
+    /**
+     * Whether the storage of the given app's public tenant is still initialising. Resources built for every app
+     * right after the storages are loaded (the signing keys) check this and skip their construction-time
+     * prefetch for such an app: querying the storage would wait for its pool initialisation (the PostgreSQL
+     * plugin's pool-init lock), so boot would block on exactly the straggler {@link #awaitStorageInit} let it
+     * continue past. They load on first use instead.
+     */
+    public static boolean isStorageStillInitialising(Main main, AppIdentifier appIdentifier) {
+        try {
+            return STORAGES_STILL_INITIALISING.contains(getStorage(appIdentifier.getAsPublicTenantIdentifier(), main));
+        } catch (TenantOrAppNotFoundException e) {
+            return false;
+        }
+    }
+
+    @TestOnly
+    static boolean isStorageStillInitialising(Storage storage) {
+        return STORAGES_STILL_INITIALISING.contains(storage);
+    }
+
+    @TestOnly
+    public static void setStorageStillInitialisingForTesting(Storage storage, boolean stillInitialising) {
+        if (stillInitialising) {
+            STORAGES_STILL_INITIALISING.add(storage);
+        } else {
+            STORAGES_STILL_INITIALISING.remove(storage);
+        }
+    }
+
+    /**
+     * The executor {@link #initStoragesInParallel} runs on: a fixed pool of daemon platform threads, at most
+     * {@code maxParallelism} of them (storage_init_parallelism). Boot has tens of short, blocking tasks (TCP
+     * connect + DDL), so a small pool is all the parallelism that pays off, and the bound also caps the connection
+     * burst sent at a database many tenants share. With more storages than threads, the rest queue and start
+     * as threads free up. {@link #awaitStorageInit} keeps waiting while any of them is still queued, and adds a
+     * thread for each straggler it reports (see {@link #addStorageInitThread}), so the queue keeps draining.
+     *
+     * <p>Platform threads, deliberately. This used to be a virtual-thread-per-task executor, and on JDK 21 a
+     * virtual thread that parks inside a {@code synchronized} section is pinned to its carrier. The plugins'
+     * pool initialisation was one such section, and every Hikari DEBUG line was logged from inside it. With a
+     * carrier pool sized to the CPU count (2 on a small container) and dozens of storages contending for the
+     * shared console-appender and {@code System.out} locks, every carrier ended up occupied by a pinned
+     * waiter, the lock owner could never be scheduled to release it, and boot hung forever. A pool of platform
+     * threads cannot be wedged that way, whatever the plugin or its libraries lock on. Daemon, so a straggler
+     * left behind by {@link #awaitStorageInit} never keeps the JVM alive.
+     */
+    static ThreadPoolExecutor newStorageInitExecutor(int storageCount, int maxParallelism) {
+        AtomicInteger threadNumber = new AtomicInteger();
+        return (ThreadPoolExecutor) Executors.newFixedThreadPool(
+                Math.max(1, Math.min(storageCount, maxParallelism)),
+                runnable -> {
+                    Thread thread = new Thread(runnable, "storage-init-" + threadNumber.incrementAndGet());
+                    thread.setDaemon(true);
+                    return thread;
+                });
+    }
+
+    /**
+     * Gives the executor one more thread, which picks up the next queued task. Called once for every straggler
+     * {@link #awaitStorageInit} reports: the straggler keeps its thread, so without this, as many wedged
+     * storages as there are threads would keep every queued storage from ever starting, and boot would wait
+     * forever.
+     */
+    static void addStorageInitThread(ThreadPoolExecutor executor) {
+        synchronized (executor) {
+            // the maximum first: a core size above the maximum is rejected
+            executor.setMaximumPoolSize(executor.getMaximumPoolSize() + 1);
+            executor.setCorePoolSize(executor.getCorePoolSize() + 1);
+        }
+    }
+
+    /**
+     * Waits for the storage-init futures without ever waiting forever. Every {@code progressIntervalSeconds},
+     * the tenants of the storages still initialising are logged, and each storage whose init task has been
+     * running for {@code timeoutSeconds} (counted from its own start, read from {@code startedAtNanos}) is
+     * reported once as a straggler, and {@code onStraggler} is run for it. The method returns {@code false} once
+     * every unfinished storage is such a straggler: the stragglers are reported as an error,
+     * {@link ProcessState.PROCESS_STATE#STORAGE_INIT_TIMED_OUT} is recorded, and boot continues without them.
+     * While any storage has not started yet, it keeps waiting, so boot never continues past a storage that has
+     * not even begun to initialise.
+     *
+     * <p>Stragglers are neither cancelled nor interrupted (one may be mid-DDL). Each one left behind is inside
+     * its {@code initStorage} call, and one that eventually finishes is usable. What its queries do until then
+     * is up to the plugin: the PostgreSQL plugin registers the pool before it connects, so they wait on its
+     * pool initialisation. Boot itself does not wait for a straggler afterwards: the per-app signing-key resources
+     * skip their construction-time prefetch while the app's storage is still initialising (see
+     * {@link #isStorageStillInitialising(Main, AppIdentifier)}) and load on first use, and feature flags only read the storage on first
+     * use anyway, so neither needs reloading when the straggler finishes. Requests and cron runs that need the
+     * straggler before it finishes wait for it.
+     *
+     * <p>A storage is reported as soon as it reaches its limit, not on the next progress log: the wait wakes up at
+     * whichever comes first, so a limit shorter than the progress interval is still kept.
+     *
+     * <p>An unexpected exception from a task is rethrown as a {@link CompletionException}, exactly as the
+     * previous {@code CompletableFuture.join()} did, so such a failure still crashes startup. That includes a
+     * task that failed while another storage is still initialising: failed futures are checked every time the
+     * wait wakes up.
+     *
+     * @param tenantsPerFuture the tenants of the storage behind the future at the same index, for the reports
+     * @param startedAtNanos   the {@link System#nanoTime()} at which the task behind the future at the same index
+     *                         started, or {@link #STORAGE_INIT_NOT_STARTED} while it is still queued
+     * @return {@code true} if every future finished, {@code false} if boot continues without stragglers
+     */
+    static boolean awaitStorageInit(Main main, List<CompletableFuture<Void>> futures,
+                                    List<List<TenantIdentifier>> tenantsPerFuture, AtomicLongArray startedAtNanos,
+                                    Runnable onStraggler, long progressIntervalSeconds, long timeoutSeconds) {
+        CompletableFuture<Void> all = CompletableFuture.allOf(futures.toArray(new CompletableFuture[0]));
+        long timeoutNanos = TimeUnit.SECONDS.toNanos(timeoutSeconds);
+        long progressIntervalNanos = TimeUnit.SECONDS.toNanos(progressIntervalSeconds);
+        boolean[] reported = new boolean[futures.size()];
+        long nextProgressLogAt = System.nanoTime() + progressIntervalNanos;
+        while (true) {
+            // Wake up for the next progress log or the next storage to reach its limit, whichever is first. A
+            // queued storage has its whole limit ahead of it once it starts, so the limit bounds the wait for it.
+            long waitNanos = nextProgressLogAt - System.nanoTime();
+            for (int i = 0; i < futures.size(); i++) {
+                if (reported[i] || futures.get(i).isDone()) {
+                    continue;
+                }
+                long startedAt = startedAtNanos.get(i);
+                long untilLimit = startedAt == STORAGE_INIT_NOT_STARTED
+                        ? timeoutNanos
+                        : startedAt + timeoutNanos - System.nanoTime();
+                waitNanos = Math.min(waitNanos, untilLimit);
+            }
+            try {
+                all.get(Math.max(waitNanos, 0), TimeUnit.NANOSECONDS);
+                return true;
+            } catch (TimeoutException e) {
+                // allOf only completes once every future is done, so a task that already failed would otherwise
+                // stay unnoticed while another one is still running.
+                for (CompletableFuture<Void> future : futures) {
+                    if (future.isCompletedExceptionally()) {
+                        future.join(); // throws the task's failure as a CompletionException
+                    }
+                }
+                long now = System.nanoTime();
+                List<List<TenantIdentifier>> stillInitialising = new ArrayList<>();
+                List<List<TenantIdentifier>> stragglers = new ArrayList<>();
+                int queued = 0;
+                for (int i = 0; i < futures.size(); i++) {
+                    if (futures.get(i).isDone()) {
+                        continue;
+                    }
+                    long startedAt = startedAtNanos.get(i);
+                    if (startedAt == STORAGE_INIT_NOT_STARTED) {
+                        queued++;
+                        continue;
+                    }
+                    if (!reported[i] && now - startedAt >= timeoutNanos) {
+                        reported[i] = true;
+                        Logging.error(main, TenantIdentifier.BASE_TENANT,
+                                "Storage initialisation did not finish within " + timeoutSeconds + "s for tenants "
+                                        + tenantsPerFuture.get(i) + ". Take a thread dump to see what it is "
+                                        + "blocked on.", true);
+                        onStraggler.run();
+                    }
+                    if (reported[i]) {
+                        stragglers.add(tenantsPerFuture.get(i));
+                    } else {
+                        stillInitialising.add(tenantsPerFuture.get(i));
+                    }
+                }
+                if (queued == 0 && stillInitialising.isEmpty()) {
+                    Logging.error(main, TenantIdentifier.BASE_TENANT,
+                            "Continuing startup without " + stragglers.size() + " storage(s) that did not "
+                                    + "finish initialising within " + timeoutSeconds + "s (tenants: " + stragglers
+                                    + "). They keep initialising in the background.", true);
+                    ProcessState.getInstance(main).addState(ProcessState.PROCESS_STATE.STORAGE_INIT_TIMED_OUT, null);
+                    return false;
+                }
+                if (now - nextProgressLogAt >= 0) {
+                    Logging.warn(main, TenantIdentifier.BASE_TENANT,
+                            "Still waiting for " + (stillInitialising.size() + queued) + " storage(s) to initialise ("
+                                    + queued + " not started yet; tenants initialising: " + stillInitialising + ")");
+                    nextProgressLogAt = now + progressIntervalNanos;
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new RuntimeException(e);
+            } catch (ExecutionException e) {
+                throw new CompletionException(e.getCause());
+            }
+        }
+    }
+
+    /**
+     * Initializes each storage's connection pool concurrently on the pool of platform threads from
+     * {@link #newStorageInitExecutor} (see there for why not virtual threads), waiting with
+     * {@link #awaitStorageInit} so that a storage that never finishes cannot hang boot.
+     *
+     * <p>The base tenant's storage is the exception: it is initialised on the calling thread, before the other
+     * storages are submitted and with no time limit. Boot never continues without it. {@code Main.init} closes
+     * the base storage and re-initialises it through this path, and the feature flags and signing keys loaded
+     * right after need it.
+     *
+     * <p>This method MUST be called outside any ResourceDistributor lock. {@code initStorage()}
+     * opens TCP connections to the database and runs DDL (CREATE TABLE IF NOT EXISTS). That
+     * work can take tens of milliseconds per pool; holding the global lock during I/O would
+     * serialize all N pools and turn startup into O(N × latency) instead of O(latency).
+     *
+     * <p>The map is deduplicated by {@link Storage} instance, so each pool is initialized
+     * exactly once even when multiple tenants share a pool. We are therefore not actually
+     * racing concurrent {@code initStorage()} calls against each other on a single instance —
+     * the per-instance {@code isAlreadyInitialised} guard inside {@code initStorage()} is
+     * belt-and-braces, not load-bearing here.
+     *
+     * <p>Per-pool failures are caught and logged: a non-base-tenant pool failure must not
+     * prevent other tenants from working, matching the original sequential behaviour.
+     * {@code DbInitException} is the only checked exception either method declares;
+     * {@code initFileLogging} declares none. Anything else (e.g. a {@link RuntimeException}
+     * from log file setup) is propagated (by {@code awaitStorageInit} as a
+     * {@code CompletionException}, or directly for the base storage) and crashes startup —
+     * same as the original sequential code, where such an exception would have escaped the
+     * for-loop unhandled.
+     */
+    static void initStoragesInParallel(Main main, Map<Storage, Set<TenantIdentifier>> storagesToInit) {
+        initStoragesInParallel(main, storagesToInit, STORAGE_INIT_PROGRESS_LOG_INTERVAL_SECONDS,
+                Config.getBaseConfig(main).getStorageInitTimeoutSeconds());
+    }
+
+    // Package-private with the wait bounds as parameters so tests can use short ones. The number of storages
+    // initialised at once is still read from storage_init_parallelism.
+    static void initStoragesInParallel(Main main, Map<Storage, Set<TenantIdentifier>> storagesToInit,
+                                       long progressIntervalSeconds, long timeoutSeconds) {
+        if (storagesToInit.isEmpty()) {
+            return;
+        }
+        String infoLogPath = Config.getBaseConfig(main).getInfoLogPath(main);
+        String errorLogPath = Config.getBaseConfig(main).getErrorLogPath(main);
+        TelemetryProvider telemetry = TelemetryProvider.getInstance(main);
+
+        Storage baseStorage = null;
+        Map<Storage, Set<TenantIdentifier>> otherStorages = new HashMap<>();
+        for (Map.Entry<Storage, Set<TenantIdentifier>> entry : storagesToInit.entrySet()) {
+            if (entry.getValue().contains(TenantIdentifier.BASE_TENANT)) {
+                baseStorage = entry.getKey();
+            } else {
+                otherStorages.put(entry.getKey(), entry.getValue());
+            }
+        }
+
+        // The base storage first, on this thread and with no time limit: boot must not continue without it.
+        if (baseStorage != null) {
+            initStorage(main, baseStorage, new ArrayList<>(storagesToInit.get(baseStorage)), infoLogPath,
+                    errorLogPath, telemetry);
+        }
+        if (otherStorages.isEmpty()) {
+            return;
+        }
+
+        ThreadPoolExecutor executor = newStorageInitExecutor(otherStorages.size(),
+                Config.getBaseConfig(main).getStorageInitParallelism());
+        try {
+            List<CompletableFuture<Void>> futures = new ArrayList<>();
+            List<List<TenantIdentifier>> tenantsPerFuture = new ArrayList<>();
+            AtomicLongArray startedAtNanos = new AtomicLongArray(otherStorages.size());
+            for (int i = 0; i < otherStorages.size(); i++) {
+                startedAtNanos.set(i, STORAGE_INIT_NOT_STARTED);
+            }
+            for (Map.Entry<Storage, Set<TenantIdentifier>> entry : otherStorages.entrySet()) {
+                Storage storage = entry.getKey();
+                List<TenantIdentifier> tenants = new ArrayList<>(entry.getValue());
+                int index = futures.size();
+                tenantsPerFuture.add(tenants);
+                // from submission, so a queued storage counts too; removed however the task ends
+                STORAGES_STILL_INITIALISING.add(storage);
+                futures.add(CompletableFuture.runAsync(() -> {
+                    try {
+                        startedAtNanos.set(index, System.nanoTime());
+                        initStorage(main, storage, tenants, infoLogPath, errorLogPath, telemetry);
+                    } finally {
+                        STORAGES_STILL_INITIALISING.remove(storage);
+                    }
+                }, executor));
+            }
+            awaitStorageInit(main, futures, tenantsPerFuture, startedAtNanos, () -> addStorageInitThread(executor),
+                    progressIntervalSeconds, timeoutSeconds);
+        } finally {
+            // no shutdownNow(): a straggler may be mid-DDL and must not be interrupted. The threads are daemon, so
+            // they never keep the JVM alive; the pool simply exits once its queue drains.
+            executor.shutdown();
+        }
+    }
+
+    private static void initStorage(Main main, Storage storage, List<TenantIdentifier> tenants, String infoLogPath,
+                                    String errorLogPath, TelemetryProvider telemetry) {
+        try {
+            storage.initStorage(false, tenants);
+            storage.initFileLogging(infoLogPath, errorLogPath, telemetry);
+        } catch (DbInitException e) {
+            Logging.error(main, TenantIdentifier.BASE_TENANT, e.getMessage(), false, e);
+            return;
+        }
+        // Schema verification runs once per storage (the plugin caches a success), so this is a
+        // no-op for already-verified pools on refresh. A tenant mismatch never takes the core down:
+        // in strict mode (schema_check_strict_mode, the default) the storage refuses all queries
+        // until a re-verification passes (retrySchemaVerification runs one every minute, so the
+        // storage resumes within a minute of the migration being applied); in non-strict mode it
+        // stays fully in use and only queries touching the missing schema fail (with a hint).
+        try {
+            storage.verifySchema(Config.getBaseConfig(main).getSchemaCheckStrictMode());
+        } catch (SchemaMismatchException e) {
+            Logging.error(main, TenantIdentifier.BASE_TENANT,
+                    "Schema verification failed for storage of tenants " + tenants + ": "
+                            + e.getMessage(), true, e);
+            ProcessState.getInstance(main).addState(ProcessState.PROCESS_STATE.SCHEMA_MISMATCH, e);
+        } catch (StorageQueryException e) {
+            Logging.error(main, TenantIdentifier.BASE_TENANT,
+                    "Could not verify schema for storage of tenants " + tenants, false, e);
+        }
+    }
+
+    /**
+     * Gives every loaded storage whose schema verification has not yet passed another chance to pass. Called
+     * from {@link io.supertokens.cronjobs.syncCoreConfigWithDb.SyncCoreConfigWithDb} every minute, so a tenant
+     * storage that is refusing queries in strict mode (schema_check_strict_mode) resumes within a minute of
+     * the operator applying the migration SQL - no restart or tenant change needed. A storage that already
+     * verified returns from {@link Storage#verifySchema} without touching the database, so this is free in the
+     * steady state; a still-mismatched storage costs one schema-inspection query per run and stays quiet here,
+     * because the startup ERROR log already carries the full report.
+     */
+    public static void retrySchemaVerification(Main main) {
+        Set<Storage> storages = new HashSet<>();
+        for (ResourceDistributor.SingletonResource resource : main.getResourceDistributor()
+                .getAllResourcesWithResourceKey(RESOURCE_KEY).values()) {
+            storages.add(((StorageLayer) resource).storage);
+        }
+        boolean strictMode = Config.getBaseConfig(main).getSchemaCheckStrictMode();
+        for (Storage storage : storages) {
+            try {
+                storage.verifySchema(strictMode);
+            } catch (SchemaMismatchException e) {
+                // still mismatched: the startup ERROR already reported the details, and affected queries
+                // carry a hint pointing at it - do not repeat the report every minute
+            } catch (StorageQueryException e) {
+                Logging.debug(main, TenantIdentifier.BASE_TENANT,
+                        "Could not re-verify the database schema: " + e.getMessage());
+            }
+        }
     }
 
 }

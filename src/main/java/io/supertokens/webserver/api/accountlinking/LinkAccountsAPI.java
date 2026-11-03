@@ -21,15 +21,15 @@ import io.supertokens.ActiveUsers;
 import io.supertokens.Main;
 import io.supertokens.StorageAndUserIdMapping;
 import io.supertokens.authRecipe.AuthRecipe;
-import io.supertokens.authRecipe.exception.AccountInfoAlreadyAssociatedWithAnotherPrimaryUserIdException;
-import io.supertokens.authRecipe.exception.InputUserIdIsNotAPrimaryUserException;
-import io.supertokens.authRecipe.exception.RecipeUserIdAlreadyLinkedWithAnotherPrimaryUserIdException;
+import io.supertokens.pluginInterface.authRecipe.exceptions.AccountInfoAlreadyAssociatedWithAnotherPrimaryUserIdException;
+import io.supertokens.pluginInterface.authRecipe.exceptions.InputUserIdIsNotAPrimaryUserException;
+import io.supertokens.pluginInterface.authRecipe.exceptions.CannotLinkSinceRecipeUserIdAlreadyLinkedWithAnotherPrimaryUserIdException;
 import io.supertokens.featureflag.exceptions.FeatureNotEnabledException;
 import io.supertokens.multitenancy.exception.BadPermissionException;
 import io.supertokens.pluginInterface.RECIPE_ID;
 import io.supertokens.pluginInterface.Storage;
 import io.supertokens.pluginInterface.authRecipe.AuthRecipeUserInfo;
-import io.supertokens.pluginInterface.emailpassword.exceptions.UnknownUserIdException;
+import io.supertokens.pluginInterface.authRecipe.exceptions.UnknownUserIdException;
 import io.supertokens.pluginInterface.exceptions.StorageQueryException;
 import io.supertokens.pluginInterface.multitenancy.AppIdentifier;
 import io.supertokens.pluginInterface.multitenancy.exceptions.TenantOrAppNotFoundException;
@@ -116,8 +116,11 @@ public class LinkAccountsAPI extends WebserverAPI {
 
             if (!linkAccountsResult.wasAlreadyLinked) {
                 try {
+                    // Route to the storage backing the linked users' auth records (both accounts share one pool,
+                    // enforced above), not the app's public-tenant storage, so a separate-database tenant's
+                    // stale-row delete and dirty nudge land on the tenant's own storage.
                     ActiveUsers.updateLastActiveAfterLinking(
-                            main, appIdentifier, primaryUserId, recipeUserId);
+                            main, appIdentifier, primaryUserIdStorage, primaryUserId, recipeUserId);
                 } catch (Exception e) {
                     // ignore
                 }
@@ -146,7 +149,7 @@ public class LinkAccountsAPI extends WebserverAPI {
             } catch (StorageQueryException ex) {
                 throw new ServletException(ex);
             }
-        } catch (RecipeUserIdAlreadyLinkedWithAnotherPrimaryUserIdException e) {
+        } catch (CannotLinkSinceRecipeUserIdAlreadyLinkedWithAnotherPrimaryUserIdException e) {
             try {
                 JsonObject response = new JsonObject();
                 response.addProperty("status", "RECIPE_USER_ID_ALREADY_LINKED_WITH_ANOTHER_PRIMARY_USER_ID_ERROR");

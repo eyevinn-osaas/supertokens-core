@@ -1,0 +1,180 @@
+name: Release – Add release tags
+
+on:
+  workflow_call:
+    inputs:
+      core-version:
+        type: string
+        required: true
+      plugin-interface-version:
+        type: string
+        required: true
+      postgresql-plugin-version:
+        type: string
+        required: true
+      core-sha:
+        type: string
+        required: true
+      plugin-interface-sha:
+        type: string
+        required: true
+      postgresql-sha:
+        type: string
+        required: true
+      release-plugin-interface:
+        type: boolean
+        required: true
+      release-postgresql-plugin:
+        type: boolean
+        required: true
+      is-canary:
+        type: boolean
+        required: true
+      is-latest-release:
+        type: boolean
+        required: true
+      has-db-migration:
+        type: boolean
+        required: false
+        default: false
+
+jobs:
+  add-release-tags:
+    name: Add release tags
+    environment: publish
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Set up JDK 21.0.7
+        uses: actions/setup-java@v5
+        with:
+          java-version: 21.0.7
+          distribution: zulu
+
+      - name: Checkout supertokens-root
+        uses: actions/checkout@v5
+        with:
+          repository: supertokens/supertokens-root
+          path: supertokens-root
+          ref: master
+
+      - name: Checkout supertokens-core
+        run: |
+          cd supertokens-root
+          git clone https://${{ secrets.GH_TOKEN }}@github.com/supertokens/supertokens-core.git
+          git -C supertokens-core checkout ${{ inputs.core-sha }}
+
+      - name: Checkout supertokens-plugin-interface
+        run: |
+          cd supertokens-root
+          git clone https://${{ secrets.GH_TOKEN }}@github.com/supertokens/supertokens-plugin-interface.git
+          git -C supertokens-plugin-interface checkout ${{ inputs.plugin-interface-sha }}
+
+      - name: Checkout supertokens-postgresql-plugin
+        run: |
+          cd supertokens-root
+          git clone https://${{ secrets.GH_TOKEN }}@github.com/supertokens/supertokens-postgresql-plugin.git
+          git -C supertokens-postgresql-plugin checkout ${{ inputs.postgresql-sha }}
+
+      - name: Write release password
+        run: |
+          cd supertokens-root
+          echo "${{ secrets.SUPERTOKENS_API_KEY }}" > releasePassword
+          echo "${{ secrets.SUPERTOKENS_API_KEY }}" > apiPassword
+
+      - name: Load modules
+        run: |
+          cd supertokens-root
+          cat > modules.txt <<'EOF'
+          core,master
+          plugin-interface,master
+          postgresql-plugin,master
+          EOF
+          ./loadModules
+
+      - name: Setup test environment
+        run: cd supertokens-root && ./utils/setupTestEnv --local
+
+      - name: Git config
+        run: |
+          git config --global user.name "Supertokens Bot"
+          git config --global user.email "<>"
+
+      - name: Tag plugin-interface
+        id: tag-pi
+        if: inputs.release-plugin-interface && !inputs.is-canary
+        run: |
+          cd supertokens-root/supertokens-plugin-interface
+          ./addReleaseTag
+
+      - name: Create plugin-interface GitHub release
+        if: steps.tag-pi.outcome == 'success' || (inputs.release-plugin-interface && inputs.is-canary)
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+        run: |
+          repo="supertokens/supertokens-plugin-interface"
+          if [ "${{ inputs.is-canary }}" == "true" ]; then
+            tag="v${{ inputs.plugin-interface-version }}-canary"
+            extra=(--target "${{ inputs.plugin-interface-sha }}" --prerelease --latest=false)
+          else
+            tag="v${{ inputs.plugin-interface-version }}"
+            extra=(${{ inputs.is-latest-release == true && '--latest' || '--latest=false' }})
+          fi
+          if gh release view "$tag" --repo "$repo" >/dev/null 2>&1; then
+            echo "Release $tag already exists on $repo — skipping creation (idempotent re-run)"
+          else
+            gh release create "$tag" --repo "$repo" --title "$tag" --generate-notes "${extra[@]}"
+          fi
+
+      - name: Tag postgresql-plugin
+        id: tag-pg
+        if: inputs.release-postgresql-plugin && !inputs.is-canary
+        run: |
+          cd supertokens-root/supertokens-postgresql-plugin
+          ./addReleaseTag
+
+      - name: Create postgresql-plugin GitHub release
+        if: steps.tag-pg.outcome == 'success' || (inputs.release-postgresql-plugin && inputs.is-canary)
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+        run: |
+          repo="supertokens/supertokens-postgresql-plugin"
+          if [ "${{ inputs.is-canary }}" == "true" ]; then
+            tag="v${{ inputs.postgresql-plugin-version }}-canary"
+            extra=(--target "${{ inputs.postgresql-sha }}" --prerelease --latest=false)
+          else
+            tag="v${{ inputs.postgresql-plugin-version }}"
+            extra=(${{ inputs.is-latest-release == true && '--latest' || '--latest=false' }})
+          fi
+          if gh release view "$tag" --repo "$repo" >/dev/null 2>&1; then
+            echo "Release $tag already exists on $repo — skipping creation (idempotent re-run)"
+          else
+            gh release create "$tag" --repo "$repo" --title "$tag" --generate-notes "${extra[@]}"
+          fi
+
+      - name: Tag core
+        id: tag-core
+        if: '!inputs.is-canary'
+        env:
+          HAS_DB_MIGRATION: ${{ inputs.has-db-migration }}
+        run: |
+          cd supertokens-root/supertokens-core
+          ./addReleaseTag
+
+      - name: Create core GitHub release
+        if: steps.tag-core.outcome == 'success' || inputs.is-canary
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+        run: |
+          repo="supertokens/supertokens-core"
+          if [ "${{ inputs.is-canary }}" == "true" ]; then
+            tag="v${{ inputs.core-version }}-canary"
+            extra=(--target "${{ inputs.core-sha }}" --prerelease --latest=false)
+          else
+            tag="v${{ inputs.core-version }}"
+            extra=(${{ inputs.is-latest-release == true && '--latest' || '--latest=false' }})
+          fi
+          if gh release view "$tag" --repo "$repo" >/dev/null 2>&1; then
+            echo "Release $tag already exists on $repo — skipping creation (idempotent re-run)"
+          else
+            gh release create "$tag" --repo "$repo" --title "$tag" --generate-notes "${extra[@]}"
+          fi

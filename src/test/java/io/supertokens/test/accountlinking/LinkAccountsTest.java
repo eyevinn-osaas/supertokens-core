@@ -20,19 +20,22 @@ import com.google.gson.JsonObject;
 import io.supertokens.ActiveUsers;
 import io.supertokens.ProcessState;
 import io.supertokens.authRecipe.AuthRecipe;
-import io.supertokens.authRecipe.exception.AccountInfoAlreadyAssociatedWithAnotherPrimaryUserIdException;
-import io.supertokens.authRecipe.exception.InputUserIdIsNotAPrimaryUserException;
-import io.supertokens.authRecipe.exception.RecipeUserIdAlreadyLinkedWithAnotherPrimaryUserIdException;
+import io.supertokens.cronjobs.rollupUserLastActive.RollupUserLastActive;
+import io.supertokens.pluginInterface.authRecipe.exceptions.AccountInfoAlreadyAssociatedWithAnotherPrimaryUserIdException;
+import io.supertokens.pluginInterface.authRecipe.exceptions.InputUserIdIsNotAPrimaryUserException;
+import io.supertokens.pluginInterface.authRecipe.exceptions.CannotLinkSinceRecipeUserIdAlreadyLinkedWithAnotherPrimaryUserIdException;
 import io.supertokens.emailpassword.EmailPassword;
 import io.supertokens.featureflag.EE_FEATURES;
 import io.supertokens.featureflag.FeatureFlagTestContent;
 import io.supertokens.featureflag.exceptions.FeatureNotEnabledException;
 import io.supertokens.multitenancy.Multitenancy;
 import io.supertokens.passwordless.Passwordless;
+import io.supertokens.pluginInterface.MigrationMode;
 import io.supertokens.pluginInterface.STORAGE_TYPE;
 import io.supertokens.pluginInterface.Storage;
+import io.supertokens.pluginInterface.migration.MigrationBackfillStorage;
 import io.supertokens.pluginInterface.authRecipe.AuthRecipeUserInfo;
-import io.supertokens.pluginInterface.emailpassword.exceptions.UnknownUserIdException;
+import io.supertokens.pluginInterface.authRecipe.exceptions.UnknownUserIdException;
 import io.supertokens.pluginInterface.multitenancy.*;
 import io.supertokens.session.Session;
 import io.supertokens.storageLayer.StorageLayer;
@@ -164,6 +167,97 @@ public class LinkAccountsTest {
         // cause linkAccounts revokes sessions for the recipe user ID
         sessions = Session.getAllNonExpiredSessionHandlesForUser(process.getProcess(), user2.getSupertokensUserId());
         assert (sessions.length == 0);
+
+        process.kill();
+        assertNotNull(process.checkOrWaitForEvent(ProcessState.PROCESS_STATE.STOPPED));
+    }
+
+    @Test
+    public void linkAccountSuccessWithSameEmailWherePrimaryUserIsCreatedFirstInLegacyMigrationMode()
+            throws Exception {
+        linkAccountSuccessWithSameEmailWherePrimaryUserIsCreatedFirstWithMigrationMode("LEGACY");
+    }
+
+    @Test
+    public void linkAccountSuccessWithSameEmailWherePrimaryUserIsCreatedFirstInMigratedMigrationMode()
+            throws Exception {
+        linkAccountSuccessWithSameEmailWherePrimaryUserIsCreatedFirstWithMigrationMode("MIGRATED");
+    }
+
+    private void linkAccountSuccessWithSameEmailWherePrimaryUserIsCreatedFirstWithMigrationMode(String migrationMode)
+            throws Exception {
+        Utils.setValueInConfig("migration_mode", migrationMode);
+        String[] args = {"../"};
+        TestingProcessManager.TestingProcess process = TestingProcessManager.startIsolatedProcess(args, false);
+        FeatureFlagTestContent.getInstance(process.getProcess())
+                .setKeyValue(FeatureFlagTestContent.ENABLED_FEATURES, new EE_FEATURES[]{
+                        EE_FEATURES.ACCOUNT_LINKING, EE_FEATURES.MULTI_TENANCY});
+        process.startProcess();
+        assertNotNull(process.checkOrWaitForEvent(ProcessState.PROCESS_STATE.STARTED));
+
+        if (StorageLayer.getStorage(process.getProcess()).getType() != STORAGE_TYPE.SQL) {
+            return;
+        }
+
+        // The in-memory storage does not honor migration_mode from the config: it reports a
+        // hardcoded MIGRATED (SQLiteConfig.getMigrationMode) and its account-linking checks are
+        // pinned to the new-tables queries, so LEGACY-mode linking cannot be exercised on it.
+        // Mode-dependent coverage for this flow lives in the postgresql matrix.
+        if (StorageLayer.isInMemDb(process.getProcess())) {
+            return;
+        }
+
+        // make sure the config override was actually picked up, otherwise both variants
+        // of this test would silently run in the same mode
+        assertEquals(MigrationMode.valueOf(migrationMode),
+                ((MigrationBackfillStorage) StorageLayer.getStorage(process.getProcess())).getMigrationMode());
+
+        AuthRecipeUserInfo user = EmailPassword.signUp(process.getProcess(), "test@example.com", "password");
+        assert (!user.isPrimaryUser);
+
+        AuthRecipe.createPrimaryUser(process.getProcess(), user.getSupertokensUserId());
+
+        Thread.sleep(50);
+
+        ThirdParty.SignInUpResponse signInUpResponse = ThirdParty.signInUp(process.getProcess(), "google",
+                "user-google",
+                "test@example.com");
+        AuthRecipeUserInfo user2 = signInUpResponse.user;
+        assert (!user2.isPrimaryUser);
+
+        Session.createNewSession(process.getProcess(), user2.getSupertokensUserId(), new JsonObject(), new JsonObject());
+        String[] sessions = Session.getAllNonExpiredSessionHandlesForUser(process.getProcess(), user2.getSupertokensUserId());
+        assert (sessions.length == 1);
+
+        boolean wasAlreadyLinked = AuthRecipe.linkAccounts(process.getProcess(), user2.getSupertokensUserId(),
+                user.getSupertokensUserId()).wasAlreadyLinked;
+        assert (!wasAlreadyLinked);
+
+        AuthRecipeUserInfo refetchUser2 = AuthRecipe.getUserById(process.getProcess(), user2.getSupertokensUserId());
+        AuthRecipeUserInfo refetchUser = AuthRecipe.getUserById(process.getProcess(), user.getSupertokensUserId());
+        assert (refetchUser2.equals(refetchUser));
+        assert (refetchUser2.loginMethods.length == 2);
+        assert (refetchUser.loginMethods[0].equals(user.loginMethods[0]));
+        assert (refetchUser.loginMethods[1].equals(user2.loginMethods[0]));
+        assert (refetchUser.tenantIds.size() == 1);
+        assert (refetchUser.isPrimaryUser);
+        assert (refetchUser.getSupertokensUserId().equals(user.getSupertokensUserId()));
+
+        // cause linkAccounts revokes sessions for the recipe user ID
+        sessions = Session.getAllNonExpiredSessionHandlesForUser(process.getProcess(), user2.getSupertokensUserId());
+        assert (sessions.length == 0);
+
+        Session.createNewSession(process.getProcess(), user2.getSupertokensUserId(), new JsonObject(), new JsonObject());
+        sessions = Session.getAllNonExpiredSessionHandlesForUser(process.getProcess(), user2.getSupertokensUserId());
+        assert (sessions.length == 1);
+
+        wasAlreadyLinked = AuthRecipe.linkAccounts(process.getProcess(), user2.getSupertokensUserId(),
+                user.getSupertokensUserId()).wasAlreadyLinked;
+        assert (wasAlreadyLinked);
+
+        // linking an already linked user is a no-op, so sessions must not be revoked again
+        sessions = Session.getAllNonExpiredSessionHandlesForUser(process.getProcess(), user2.getSupertokensUserId());
+        assert (sessions.length == 1);
 
         process.kill();
         assertNotNull(process.checkOrWaitForEvent(ProcessState.PROCESS_STATE.STOPPED));
@@ -325,7 +419,7 @@ public class LinkAccountsTest {
         try {
             AuthRecipe.linkAccounts(process.getProcess(), user2.getSupertokensUserId(), user3.getSupertokensUserId());
             assert (false);
-        } catch (RecipeUserIdAlreadyLinkedWithAnotherPrimaryUserIdException e) {
+        } catch (CannotLinkSinceRecipeUserIdAlreadyLinkedWithAnotherPrimaryUserIdException e) {
             assert (e.recipeUser.getSupertokensUserId().equals(user.getSupertokensUserId()));
             assert (e.getMessage().equals("The input recipe user ID is already linked to another user ID"));
         }
@@ -702,11 +796,14 @@ public class LinkAccountsTest {
         long secondUserTime = System.currentTimeMillis();
         ActiveUsers.updateLastActive(process.getProcess(), user2.getSupertokensUserId());
 
+        // Sole-writer cutover (PLAN-011): activity reaches user_last_active only through a rollup fold.
+        RollupUserLastActive.runOnceForAllStoragesForTesting(process.getProcess());
         assertEquals(ActiveUsers.countUsersActiveSince(process.getProcess(), 0), 2);
         long createPrimaryTime = System.currentTimeMillis();
         AuthRecipe.createPrimaryUser(process.getProcess(), user.getSupertokensUserId());
         Thread.sleep(50);
 
+        RollupUserLastActive.runOnceForAllStoragesForTesting(process.getProcess());
         assertEquals(ActiveUsers.countUsersActiveSince(process.getProcess(), 0), 2);
 
         {
@@ -721,6 +818,9 @@ public class LinkAccountsTest {
             assertEquals("OK", response.get("status").getAsString());
         }
 
+        // Fold, then reconcile removes the linked-away recipe user's row (the account_linking event stays
+        // within the fold window), so the merged pair counts once — matching the pre-cutover direct write.
+        RollupUserLastActive.runOnceForAllStoragesForTesting(process.getProcess());
         assertEquals(ActiveUsers.countUsersActiveSince(process.getProcess(), 0), 1);
         assertEquals(ActiveUsers.countUsersActiveSince(process.getProcess(), secondUserTime), 1);
         assertEquals(ActiveUsers.countUsersActiveSince(process.getProcess(), createPrimaryTime),
@@ -753,11 +853,14 @@ public class LinkAccountsTest {
         long secondUserTime = System.currentTimeMillis();
         ActiveUsers.updateLastActive(process.getProcess(), user2.getSupertokensUserId());
 
+        // Sole-writer cutover (PLAN-011): activity reaches user_last_active only through a rollup fold.
+        RollupUserLastActive.runOnceForAllStoragesForTesting(process.getProcess());
         assertEquals(ActiveUsers.countUsersActiveSince(process.getProcess(), 0), 2);
         long createPrimaryTime = System.currentTimeMillis();
         AuthRecipe.createPrimaryUser(process.getProcess(), user2.getSupertokensUserId());
         Thread.sleep(50);
 
+        RollupUserLastActive.runOnceForAllStoragesForTesting(process.getProcess());
         assertEquals(ActiveUsers.countUsersActiveSince(process.getProcess(), 0), 2);
 
         {
@@ -772,6 +875,9 @@ public class LinkAccountsTest {
             assertEquals("OK", response.get("status").getAsString());
         }
 
+        // Fold, then reconcile removes the linked-away recipe user's row (the account_linking event stays
+        // within the fold window), so the merged pair counts once — matching the pre-cutover direct write.
+        RollupUserLastActive.runOnceForAllStoragesForTesting(process.getProcess());
         assertEquals(ActiveUsers.countUsersActiveSince(process.getProcess(), 0), 1);
         assertEquals(ActiveUsers.countUsersActiveSince(process.getProcess(), secondUserTime), 1);
         assertEquals(ActiveUsers.countUsersActiveSince(process.getProcess(), createPrimaryTime),

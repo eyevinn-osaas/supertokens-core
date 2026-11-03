@@ -24,6 +24,8 @@ import java.util.Arrays;
 
 import javax.crypto.spec.SecretKeySpec;
 
+import io.supertokens.authRecipe.AuthRecipe;
+import io.supertokens.pluginInterface.emailpassword.exceptions.DuplicateEmailException;
 import org.apache.commons.codec.binary.Base32;
 import org.junit.AfterClass;
 import static org.junit.Assert.assertEquals;
@@ -38,6 +40,7 @@ import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
 
 import io.supertokens.ActiveUsers;
+import io.supertokens.pluginInterface.auditlog.ActivityEventType;
 import io.supertokens.Main;
 import io.supertokens.ProcessState;
 import io.supertokens.bulkimport.BulkImport;
@@ -67,7 +70,6 @@ import io.supertokens.pluginInterface.webauthn.AccountRecoveryTokenInfo;
 import io.supertokens.pluginInterface.webauthn.WebAuthNOptions;
 import io.supertokens.pluginInterface.webauthn.WebAuthNStorage;
 import io.supertokens.pluginInterface.webauthn.WebAuthNStoredCredential;
-import io.supertokens.pluginInterface.webauthn.exceptions.DuplicateUserEmailException;
 import io.supertokens.pluginInterface.webauthn.exceptions.DuplicateUserIdException;
 import io.supertokens.pluginInterface.webauthn.slqStorage.WebAuthNSQLStorage;
 import io.supertokens.session.Session;
@@ -102,6 +104,14 @@ public class TestAppData {
         return Arrays.stream(arr).filter(s -> !Arrays.asList(toRemove).contains(s)).toArray(String[]::new);
     }
 
+    // activity_log is an append-only audit log with no app_id->apps FK cascade, so its rows are
+    // intentionally retained after an app is deleted. On Postgres it is range-partitioned, so its
+    // physical tables are the parent plus dynamically-named monthly/default partitions
+    // (activity_log, activity_log_default, activity_log_pYYYYMM) — match the whole family by prefix.
+    private String[] removeActivityLogTables(String[] arr) {
+        return Arrays.stream(arr).filter(s -> !s.startsWith("activity_log")).toArray(String[]::new);
+    }
+
     private static String generateTotpCode(Main main, TOTPDevice device, int step)
             throws InvalidKeyException, StorageQueryException {
         final TimeBasedOneTimePasswordGenerator totp = new TimeBasedOneTimePasswordGenerator(
@@ -130,7 +140,21 @@ public class TestAppData {
         }
 
         String[] tablesToIgnore = new String[]{"tenant_thirdparty_provider_clients", "tenant_thirdparty_providers",
-                "tenant_first_factors", "tenant_required_secondary_factors"};
+                "tenant_first_factors", "tenant_required_secondary_factors",
+                "recipe_user_tenants", "recipe_user_account_infos", "primary_user_tenants",
+                // Legacy tables that are not populated in MIGRATED mode.
+                "all_auth_recipe_users", "emailpassword_user_to_tenant", "thirdparty_user_to_tenant",
+                "passwordless_user_to_tenant", "webauthn_user_to_tenant",
+                // Legacy table: m2m stats now go to the oauth_m2m_token_stats rollup, so this is
+                // created (to drain pre-rollup rows) but never written. The rollup itself has no
+                // app_id FK on purpose — stats survive app deletion — so it is ignored too.
+                "oauth_m2m_tokens", "oauth_m2m_token_stats",
+                // Rollup-derived projection: after the PLAN-011 cutover the last-active rollup cron is
+                // the sole writer of user_last_active. updateLastActive() only appends a semantic activity
+                // event and marks the storage dirty; the projection is folded asynchronously
+                // (within a rollup interval), so this table is empty right after the synchronous recipe
+                // writes above — same situation as the activity_log tables removed below.
+                "user_last_active"};
 
         TenantIdentifier app = new TenantIdentifier(null, "a1", null);
 
@@ -146,7 +170,7 @@ public class TestAppData {
                 StorageLayer.getStorage(app, process.getProcess()));
 
         String[] allTableNames = appStorage.getAllTablesInTheDatabase();
-        allTableNames = removeStrings(allTableNames, tablesToIgnore);
+        allTableNames = removeActivityLogTables(removeStrings(allTableNames, tablesToIgnore));
         Arrays.sort(allTableNames);
 
         // Add all recipe data
@@ -154,6 +178,7 @@ public class TestAppData {
                 "password");
         EmailPassword.generatePasswordResetTokenBeforeCdi4_0(app, appStorage, process.getProcess(),
                 epUser.getSupertokensUserId());
+        AuthRecipe.createPrimaryUser(process.getProcess(), app.toAppIdentifier(), appStorage, epUser.getSupertokensUserId());
 
         ThirdParty.SignInUpResponse tpUser = ThirdParty.signInUp(app, appStorage, process.getProcess(), "google",
                 "googleid", "test@example.com");
@@ -190,8 +215,8 @@ public class TestAppData {
         Totp.verifyCode(app, appStorage, process.getProcess(), epUser.getSupertokensUserId(),
                 generateTotpCode(process.getProcess(), totpDevice, 0));
 
-        ActiveUsers.updateLastActive(app.toAppIdentifier(), process.getProcess(),
-                epUser.getSupertokensUserId());
+        ActiveUsers.updateLastActive(app, process.getProcess(),
+                epUser.getSupertokensUserId(), ActivityEventType.SIGN_IN);
 
         UserMetadata.updateUserMetadata(app.toAppIdentifier(), appStorage,
                 epUser.getSupertokensUserId(), new JsonObject());
@@ -225,7 +250,7 @@ public class TestAppData {
                 ((WebAuthNSQLStorage) appStorage).signUpWithCredentialsRegister_Transaction(app, con, "userId", "test2@example.com", "example.com", credential);
             } catch (DuplicateUserIdException e) {
                 throw new RuntimeException(e);
-            } catch (DuplicateUserEmailException e) {
+            } catch (DuplicateEmailException e) {
                 throw new RuntimeException(e);
             }
             return null;
@@ -245,13 +270,14 @@ public class TestAppData {
         options.userVerification = "required";
         ((WebAuthNStorage) appStorage).saveGeneratedOptions(app, options);
 
-        ((SAMLStorage) appStorage).createOrUpdateSAMLClient(app, new SAMLClient("abcd", "efgh", "http://localhost:5225", new JsonArray(), "http://localhost:3000", "http://idp.example.com", "abcdefgh", false, true));
-        ((SAMLStorage) appStorage).saveRelayStateInfo(app, new SAMLRelayStateInfo("1234", "abcd", "qwer", "http://localhost:3000/auth/callback/saml"), 300000);
+        ((SAMLStorage) appStorage).createOrUpdateSAMLClient(app, new SAMLClient("abcd", "efgh", "http://localhost:5225", new JsonArray(), "http://localhost:3000", "http://idp.example.com", "abcdefgh", false, true, null));
+        ((SAMLStorage) appStorage).saveRelayStateInfo(app, new SAMLRelayStateInfo("1234", "abcd", "qwer", "http://localhost:3000/auth/callback/saml", "_reqid-1234", "http://localhost:3000/acs"), 300000);
         ((SAMLStorage) appStorage).saveSAMLClaims(app, "abcd", "efgh", new JsonObject(), 30000);
+        ((SAMLStorage) appStorage).markSAMLAssertionConsumed(app, "_assertion-1234", System.currentTimeMillis() + 300000);
 
         String[] tablesThatHaveData = appStorage
                 .getAllTablesInTheDatabaseThatHasDataForAppId(app.getAppId());
-        tablesThatHaveData = removeStrings(tablesThatHaveData, tablesToIgnore);
+        tablesThatHaveData = removeActivityLogTables(removeStrings(tablesThatHaveData, tablesToIgnore));
         Arrays.sort(tablesThatHaveData);
 
         assertEquals(allTableNames, tablesThatHaveData);
@@ -261,7 +287,7 @@ public class TestAppData {
 
         // Check no data is remaining in any of the tables
         tablesThatHaveData = appStorage.getAllTablesInTheDatabaseThatHasDataForAppId(app.getAppId());
-        tablesThatHaveData = removeStrings(tablesThatHaveData, tablesToIgnore);
+        tablesThatHaveData = removeActivityLogTables(removeStrings(tablesThatHaveData, tablesToIgnore));
         assertEquals(0, tablesThatHaveData.length);
 
         process.kill();

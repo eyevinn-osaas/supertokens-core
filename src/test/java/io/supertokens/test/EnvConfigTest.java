@@ -50,29 +50,29 @@ public class EnvConfigTest {
         Utils.reset();
     }
 
-    private static void setEnv(String key, String value) {
+    private static Map<String, String> getWritableEnv() {
         try {
             Map<String, String> env = System.getenv();
             Class<?> cl = env.getClass();
             Field field = cl.getDeclaredField("m");
             field.setAccessible(true);
-            Map<String, String> writableEnv = (Map<String, String>) field.get(env);
-            writableEnv.put(key, value);
+            return (Map<String, String>) field.get(env);
         } catch (Exception e) {
-            throw new IllegalStateException("Failed to set environment variable", e);
+            throw new IllegalStateException("Failed to get writable environment", e);
         }
     }
 
-    private static void removeEnv(String key) {
-        try {
-            Map<String, String> env = System.getenv();
-            Class<?> cl = env.getClass();
-            Field field = cl.getDeclaredField("m");
-            field.setAccessible(true);
-            Map<String, String> writableEnv = (Map<String, String>) field.get(env);
-            writableEnv.remove(key);
-        } catch (Exception e) {
-            throw new IllegalStateException("Failed to set environment variable", e);
+    private static String setEnv(String key, String value) {
+        String originalValue = System.getenv(key);
+        getWritableEnv().put(key, value);
+        return originalValue;
+    }
+
+    private static void restoreEnv(String key, String originalValue) {
+        if (originalValue == null) {
+            getWritableEnv().remove(key);
+        } else {
+            getWritableEnv().put(key, originalValue);
         }
     }
 
@@ -197,6 +197,10 @@ public class EnvConfigTest {
                 new Object[]{"BULK_MIGRATION_BATCH_SIZE", "8000", 8000}, // default
                 new Object[]{"BULK_MIGRATION_BATCH_SIZE", "1000", 1000},
                 new Object[]{"BULK_MIGRATION_BATCH_SIZE", "1", 1}, // minimum valid
+
+                // BULK_MIGRATION_SLEEP_BETWEEN_ROUNDS_IN_BATCH_MS: Integer (boxed, so it can be null in config.yaml)
+                new Object[]{"BULK_MIGRATION_SLEEP_BETWEEN_ROUNDS_IN_BATCH_MS", "5000", 5000},
+                new Object[]{"BULK_MIGRATION_SLEEP_BETWEEN_ROUNDS_IN_BATCH_MS", "0", 0},
                 
                 // WEBAUTHN_RECOVER_ACCOUNT_TOKEN_LIFETIME: must be > 0 (in milliseconds)
                 new Object[]{"WEBAUTHN_RECOVER_ACCOUNT_TOKEN_LIFETIME", "3600000", (long) 3600000}, // 1 hour
@@ -234,33 +238,35 @@ public class EnvConfigTest {
 
         for (Object[] testCase : testCases) {
             String[] args = {"../"};
-            setEnv(testCase[0].toString(), testCase[1].toString());
+            String envKey = testCase[0].toString();
+            String originalValue = setEnv(envKey, testCase[1].toString());
+            try {
+                TestingProcessManager.TestingProcess process = TestingProcessManager.startIsolatedProcess(args);
+                ProcessState.EventAndException startEvent = process.checkOrWaitForEvent(ProcessState.PROCESS_STATE.STARTED);
+                assertNotNull(startEvent);
 
-            TestingProcessManager.TestingProcess process = TestingProcessManager.startIsolatedProcess(args);
-            ProcessState.EventAndException startEvent = process.checkOrWaitForEvent(ProcessState.PROCESS_STATE.STARTED);
-            assertNotNull(startEvent);
+                CoreConfig config = Config.getBaseConfig(process.getProcess());
+                boolean fieldChecked = false;
+                for (Field field : config.getClass().getDeclaredFields()) {
+                    if (!field.isAnnotationPresent(EnvName.class)) {
+                        continue;
+                    }
 
-            CoreConfig config = Config.getBaseConfig(process.getProcess());
-            boolean fieldChecked = false;
-            for (Field field : config.getClass().getDeclaredFields()) {
-                if (!field.isAnnotationPresent(EnvName.class)) {
-                    continue;
+                    field.setAccessible(true);
+                    if (field.getAnnotationsByType(EnvName.class)[0].value().equals(envKey)) {
+                        assertEquals("Failed for env var: " + testCase[0] + " with value: " + testCase[1],
+                                testCase[2], field.get(config));
+                        fieldChecked = true;
+                    }
                 }
+                assertTrue("No field found for env var: " + testCase[0], fieldChecked);
 
-                field.setAccessible(true);
-                if (field.getAnnotationsByType(EnvName.class)[0].value().equals(testCase[0].toString())) {
-                    assertEquals("Failed for env var: " + testCase[0] + " with value: " + testCase[1], 
-                            testCase[2], field.get(config));
-                    fieldChecked = true;
-                }
+                process.kill();
+                ProcessState.EventAndException stopEvent = process.checkOrWaitForEvent(ProcessState.PROCESS_STATE.STOPPED);
+                assertNotNull(stopEvent);
+            } finally {
+                restoreEnv(envKey, originalValue);
             }
-            assertTrue("No field found for env var: " + testCase[0], fieldChecked);
-
-            process.kill();
-            ProcessState.EventAndException stopEvent = process.checkOrWaitForEvent(ProcessState.PROCESS_STATE.STOPPED);
-            assertNotNull(stopEvent);
-
-            removeEnv(testCase[0].toString());
         }
     }
 }

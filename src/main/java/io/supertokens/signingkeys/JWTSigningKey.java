@@ -39,8 +39,10 @@ import io.supertokens.utils.Utils;
 import org.jetbrains.annotations.TestOnly;
 
 import java.security.NoSuchAlgorithmException;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import io.supertokens.auditlog.UnauditedTransaction;
 
 public class JWTSigningKey extends ResourceDistributor.SingletonResource {
     public static final String RESOURCE_KEY = "io.supertokens.signingKeys.JWTSigningKey";
@@ -62,39 +64,36 @@ public class JWTSigningKey extends ResourceDistributor.SingletonResource {
         }
     }
 
-    public static void loadForAllTenants(Main main, List<AppIdentifier> apps, List<TenantIdentifier> tenantsThatChanged)
-            throws UnsupportedJWTSigningAlgorithmException {
-        try {
-            main.getResourceDistributor().withResourceDistributorLock(() -> {
-                Map<ResourceDistributor.KeyClass, ResourceDistributor.SingletonResource> existingResources =
-                        main.getResourceDistributor()
-                                .getAllResourcesWithResourceKey(RESOURCE_KEY);
-                main.getResourceDistributor().clearAllResourcesWithResourceKey(RESOURCE_KEY);
-                for (AppIdentifier app : apps) {
-                    ResourceDistributor.SingletonResource resource = existingResources.get(
-                            new ResourceDistributor.KeyClass(app, RESOURCE_KEY));
-                    if (resource != null && !tenantsThatChanged.contains(app.getAsPublicTenantIdentifier())) {
-                        main.getResourceDistributor().setResource(app, RESOURCE_KEY,
-                                resource);
-                    } else {
-                        try {
-                            JWTSigningKey jwtSigningKey = new JWTSigningKey(app, main);
-                            main.getResourceDistributor()
-                                    .setResource(app, RESOURCE_KEY, jwtSigningKey);
-
-                            jwtSigningKey.generateKeysForSupportedAlgos(main);
-
-                        } catch (Exception e) {
-                            Logging.error(main, app.getAsPublicTenantIdentifier(), e.getMessage(), false);
-                            // continue loading other resources
-                        }
+    public static void loadForAllTenants(Main main, List<AppIdentifier> apps, List<TenantIdentifier> tenantsThatChanged) {
+        Map<ResourceDistributor.KeyClass, ResourceDistributor.SingletonResource> existingResources =
+                main.getResourceDistributor()
+                        .getAllResourcesWithResourceKey(RESOURCE_KEY);
+        Map<ResourceDistributor.KeyClass, ResourceDistributor.SingletonResource> newResources =
+                new HashMap<>();
+        for (AppIdentifier app : apps) {
+            ResourceDistributor.SingletonResource resource = existingResources.get(
+                    new ResourceDistributor.KeyClass(app, RESOURCE_KEY));
+            if (resource != null && !tenantsThatChanged.contains(app.getAsPublicTenantIdentifier())) {
+                newResources.put(new ResourceDistributor.KeyClass(app, RESOURCE_KEY), resource);
+            } else {
+                try {
+                    JWTSigningKey jwtSigningKey = new JWTSigningKey(app, main);
+                    // Register before generateKeysForSupportedAlgos so getInstance() can find it
+                    // (generateKeysForSupportedAlgos calls getInstance internally)
+                    main.getResourceDistributor().setResource(app, RESOURCE_KEY, jwtSigningKey);
+                    newResources.put(new ResourceDistributor.KeyClass(app, RESOURCE_KEY), jwtSigningKey);
+                    // Querying a storage that is still initialising would wait for it (see
+                    // StorageLayer.isStorageStillInitialising); the keys are then created on first use.
+                    if (!StorageLayer.isStorageStillInitialising(main, app)) {
+                        jwtSigningKey.generateKeysForSupportedAlgos(main);
                     }
+                } catch (Exception e) {
+                    Logging.error(main, app.getAsPublicTenantIdentifier(), e.getMessage(), false);
+                    // continue loading other resources
                 }
-                return null;
-            });
-        } catch (ResourceDistributor.FuncException e) {
-            throw new IllegalStateException("should never happen", e);
+            }
         }
+        main.getResourceDistributor().replaceResourcesWithResourceKey(RESOURCE_KEY, newResources);
     }
 
     public enum SupportedAlgorithms {
@@ -140,9 +139,12 @@ public class JWTSigningKey extends ResourceDistributor.SingletonResource {
      * @throws StorageQueryException            If there is an error interacting with the database
      * @throws StorageTransactionLogicException If there is an error interacting with the database
      */
+    @UnauditedTransaction(justification = "System signing-key or certificate housekeeping; no user-facing state change to audit.")
     public List<JWTSigningKeyInfo> getAllSigningKeys()
             throws StorageQueryException, StorageTransactionLogicException, TenantOrAppNotFoundException,
             UnsupportedJWTSigningAlgorithmException {
+        // a static legacy access token signing key moves into these keys, so move it before reading them
+        AccessTokenSigningKey.getInstance(appIdentifier, main).ensureLegacyKeyTransferred();
         JWTRecipeStorage storage = (JWTRecipeStorage) StorageLayer.getStorage(
                 this.appIdentifier.getAsPublicTenantIdentifier(), main);
 
@@ -184,9 +186,13 @@ public class JWTSigningKey extends ResourceDistributor.SingletonResource {
      * @throws StorageQueryException                   If there is an error interacting with the database
      * @throws StorageTransactionLogicException        If there is an error interacting with the database
      */
+    @UnauditedTransaction(justification = "System signing-key or certificate housekeeping; no user-facing state change to audit.")
     public JWTSigningKeyInfo getOrCreateAndGetKeyForAlgorithm(SupportedAlgorithms algorithm)
             throws UnsupportedJWTSigningAlgorithmException, StorageQueryException, StorageTransactionLogicException,
             TenantOrAppNotFoundException {
+        // a static legacy access token signing key becomes an RS256 key here; move it before deciding whether one
+        // has to be generated
+        AccessTokenSigningKey.getInstance(appIdentifier, main).ensureLegacyKeyTransferred();
         JWTRecipeStorage storage = (JWTRecipeStorage) StorageLayer.getStorage(
                 this.appIdentifier.getAsPublicTenantIdentifier(), main);
 

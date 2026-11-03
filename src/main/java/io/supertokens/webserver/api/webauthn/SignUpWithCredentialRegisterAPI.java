@@ -20,10 +20,10 @@ import com.google.gson.JsonObject;
 import io.supertokens.ActiveUsers;
 import io.supertokens.Main;
 import io.supertokens.pluginInterface.Storage;
+import io.supertokens.pluginInterface.emailpassword.exceptions.DuplicateEmailException;
 import io.supertokens.pluginInterface.exceptions.StorageQueryException;
 import io.supertokens.pluginInterface.multitenancy.TenantIdentifier;
 import io.supertokens.pluginInterface.multitenancy.exceptions.TenantOrAppNotFoundException;
-import io.supertokens.pluginInterface.webauthn.exceptions.DuplicateUserEmailException;
 import io.supertokens.pluginInterface.webauthn.exceptions.WebauthNOptionsNotExistsException;
 import io.supertokens.utils.SemVer;
 import io.supertokens.webauthn.WebAuthN;
@@ -64,8 +64,11 @@ public class SignUpWithCredentialRegisterAPI extends WebserverAPI {
             WebAuthNSignInUpResult signUpResult = WebAuthN.signUp(storage, tenantIdentifier, webauthnGeneratedOptionsId,
                     credentialsData);
 
-            ActiveUsers.updateLastActive(tenantIdentifier.toAppIdentifier(), main,
-                    signUpResult.userInfo.getSupertokensUserId());
+            // No activity event on sign-up: the in-transaction user_creation lifecycle event already records
+            // this as activity and the last-active fold reads it. That event is written via
+            // startAuditedTransaction and so does not mark the rollup dirty, so wake the rollup here — otherwise
+            // a sign-up-only user would fold only on the periodic backstop pass, not the next tick.
+            ActiveUsers.markLastActiveRollupDirty(main, tenantIdentifier);
 
             JsonObject userJson = signUpResult.userInfo.toJson(getVersionFromRequest(req).greaterThanOrEqualTo(SemVer.v5_3));
 
@@ -86,7 +89,7 @@ public class SignUpWithCredentialRegisterAPI extends WebserverAPI {
             result.addProperty("status", "INVALID_OPTIONS_ERROR");
             result.addProperty("reason", e.getMessage());
             sendJsonResponse(200, result, resp);
-        } catch (DuplicateUserEmailException e) {
+        } catch (DuplicateEmailException e) {
             JsonObject result = new JsonObject();
             result.addProperty("status", "EMAIL_ALREADY_EXISTS_ERROR");
             sendJsonResponse(200, result, resp);

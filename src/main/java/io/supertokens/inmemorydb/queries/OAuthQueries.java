@@ -16,6 +16,7 @@
 
 package io.supertokens.inmemorydb.queries;
 
+import io.supertokens.inmemorydb.ConnectionPool;
 import io.supertokens.inmemorydb.Start;
 import io.supertokens.inmemorydb.Utils;
 import io.supertokens.inmemorydb.config.Config;
@@ -25,6 +26,7 @@ import io.supertokens.pluginInterface.oauth.OAuthClient;
 import io.supertokens.pluginInterface.oauth.OAuthLogoutChallenge;
 import org.jetbrains.annotations.NotNull;
 
+import java.sql.Connection;
 import java.sql.SQLException;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -106,6 +108,30 @@ public class OAuthQueries {
                 + oAuth2M2MTokensTable + "(exp DESC);";
     }
 
+    public static String getQueryToCreateOAuthM2MTokenStatsTable(Start start) {
+        String statsTable = Config.getConfig(start).getOAuthM2MTokenStatsTable();
+        // Mirror of the postgresql plugin's rollup table (replacing per-token oauth_m2m_tokens
+        // rows): one counter row per (app_id, iat hour-bucket, exp hour-bucket). client_id is
+        // intentionally not kept — neither stat is per-client. There is deliberately no app_id FK
+        // either: these stats must survive app deletion. Stale apps' rows age out via the
+        // retention sweep in deleteExpiredOAuthM2MTokens.
+        // @formatter:off
+        return "CREATE TABLE IF NOT EXISTS " + statsTable + " ("
+                + "app_id VARCHAR(64) DEFAULT 'public',"
+                + "iat_bucket BIGINT NOT NULL,"
+                + "exp_bucket BIGINT NOT NULL,"
+                + "count BIGINT NOT NULL DEFAULT 0,"
+                + "PRIMARY KEY (app_id, iat_bucket, exp_bucket)"
+                + ");";
+        // @formatter:on
+    }
+
+    public static String getQueryToCreateOAuthM2MTokenStatsExpBucketIndex(Start start) {
+        String statsTable = Config.getConfig(start).getOAuthM2MTokenStatsTable();
+        return "CREATE INDEX IF NOT EXISTS oauth_m2m_token_stats_exp_bucket_index ON "
+                + statsTable + "(app_id, exp_bucket);";
+    }
+
     public static String getQueryToCreateOAuthLogoutChallengesTable(Start start) {
         String oAuth2LogoutChallengesTable = Config.getConfig(start).getOAuthLogoutChallengesTable();
         // @formatter:off
@@ -132,10 +158,22 @@ public class OAuthQueries {
 
     public static OAuthClient getOAuthClientById(Start start, String clientId, AppIdentifier appIdentifier)
             throws SQLException, StorageQueryException {
+        // Borrow a pool connection and delegate to the connection-scoped twin below, so the query and its
+        // result mapping live in exactly one place.
+        try (Connection con = ConnectionPool.getConnection(start)) {
+            return getOAuthClientById(start, con, clientId, appIdentifier);
+        }
+    }
+
+    // Transaction-aware twin of getOAuthClientById: same read run on the caller's connection instead of
+    // borrowing a new one from the pool.
+    public static OAuthClient getOAuthClientById(Start start, Connection con, String clientId,
+                                                 AppIdentifier appIdentifier)
+            throws SQLException, StorageQueryException {
         String QUERY = "SELECT client_secret, is_client_credentials_only, enable_refresh_token_rotation FROM " + Config.getConfig(start).getOAuthClientsTable() +
             " WHERE client_id = ? AND app_id = ?";
 
-        return execute(start, QUERY, pst -> {
+        return execute(con, QUERY, pst -> {
             pst.setString(1, clientId);
             pst.setString(2, appIdentifier.getAppId());
         }, (result) -> {
@@ -301,11 +339,16 @@ public class OAuthQueries {
 
     public static int countTotalNumberOfOAuthM2MTokensAlive(Start start, AppIdentifier appIdentifier)
             throws SQLException, StorageQueryException {
-        String QUERY = "SELECT COUNT(*) as c FROM " + Config.getConfig(start).getOAuthM2MTokensTable() +
-                " WHERE app_id = ? AND exp > ?";
+        // SUM the rollup over buckets whose exp hour is strictly in the future. Same edge semantics
+        // as the postgresql plugin: tokens in the current exp hour are excluded even though some are
+        // still alive -> off by at most the current partial hour.
+        long nowBucket = (System.currentTimeMillis() / 1000) / 3600;
+        String QUERY = "SELECT COALESCE(SUM(count), 0) as c FROM "
+                + Config.getConfig(start).getOAuthM2MTokenStatsTable() +
+                " WHERE app_id = ? AND exp_bucket > ?";
         return execute(start, QUERY, pst -> {
             pst.setString(1, appIdentifier.getAppId());
-            pst.setLong(2, System.currentTimeMillis()/1000);
+            pst.setLong(2, nowBucket);
         }, result -> {
             if (result.next()) {
                 return result.getInt("c");
@@ -316,11 +359,15 @@ public class OAuthQueries {
 
     public static int countTotalNumberOfOAuthM2MTokensCreatedSince(Start start, AppIdentifier appIdentifier, long since)
             throws SQLException, StorageQueryException {
-        String QUERY = "SELECT COUNT(*) as c FROM " + Config.getConfig(start).getOAuthM2MTokensTable() +
-                " WHERE app_id = ? AND iat >= ?";
+        // SUM the rollup over buckets whose iat hour is at or after `since` (a millisecond epoch).
+        // A `since` landing inside a bucket over-counts by at most that bucket's partial hour.
+        long sinceBucket = (since / 1000) / 3600;
+        String QUERY = "SELECT COALESCE(SUM(count), 0) as c FROM "
+                + Config.getConfig(start).getOAuthM2MTokenStatsTable() +
+                " WHERE app_id = ? AND iat_bucket >= ?";
         return execute(start, QUERY, pst -> {
             pst.setString(1, appIdentifier.getAppId());
-            pst.setLong(2, since / 1000);
+            pst.setLong(2, sinceBucket);
         }, result -> {
             if (result.next()) {
                 return result.getInt("c");
@@ -331,13 +378,19 @@ public class OAuthQueries {
 
     public static void addOAuthM2MTokenForStats(Start start, AppIdentifier appIdentifier, String clientId, long iat, long exp)
             throws SQLException, StorageQueryException {
-        String QUERY = "INSERT INTO " + Config.getConfig(start).getOAuthM2MTokensTable() +
-                " (app_id, client_id, iat, exp) VALUES (?, ?, ?, ?) ON CONFLICT DO NOTHING";
+        // Bucket the token into hourly (epoch-hour) iat/exp buckets and increment a counter instead
+        // of storing one row per issued token, matching the postgresql plugin. `clientId` is unused
+        // now (the rollup table has no client_id); the parameter is kept so the OAuthStorage
+        // signature is unchanged.
+        long iatBucket = iat / 3600;
+        long expBucket = exp / 3600;
+        String QUERY = "INSERT INTO " + Config.getConfig(start).getOAuthM2MTokenStatsTable() +
+                " (app_id, iat_bucket, exp_bucket, count) VALUES (?, ?, ?, 1)" +
+                " ON CONFLICT (app_id, iat_bucket, exp_bucket) DO UPDATE SET count = count + 1";
         update(start, QUERY, pst -> {
             pst.setString(1, appIdentifier.getAppId());
-            pst.setString(2, clientId);
-            pst.setLong(3, iat);
-            pst.setLong(4, exp);
+            pst.setLong(2, iatBucket);
+            pst.setLong(3, expBucket);
         });
     }
 
@@ -410,6 +463,44 @@ public class OAuthQueries {
         });
     }
 
+    public static String getRefreshTokenMappingForUpdate(Start start, Connection con,
+                                                         AppIdentifier appIdentifier,
+                                                         String externalRefreshToken)
+            throws SQLException, StorageQueryException {
+        String QUERY = "SELECT internal_refresh_token FROM " + Config.getConfig(start).getOAuthSessionsTable() +
+                " WHERE app_id = ? AND external_refresh_token = ?";
+        return execute(con, QUERY, pst -> {
+            pst.setString(1, appIdentifier.getAppId());
+            pst.setString(2, externalRefreshToken);
+        }, result -> {
+            if (result.next()) {
+                return result.getString("internal_refresh_token");
+            }
+            return null;
+        });
+    }
+
+    public static void updateOAuthSessionInternal(Start start, Connection con,
+                                                   AppIdentifier appIdentifier,
+                                                   String gid,
+                                                   String newInternalRefreshToken,
+                                                   String sessionHandle,
+                                                   String jti,
+                                                   long exp)
+            throws SQLException, StorageQueryException {
+        String QUERY = "UPDATE " + Config.getConfig(start).getOAuthSessionsTable() +
+                " SET internal_refresh_token = ?, session_handle = ?, jti = CONCAT(jti, ?), exp = ?" +
+                " WHERE gid = ? AND app_id = ?";
+        update(con, QUERY, pst -> {
+            pst.setString(1, newInternalRefreshToken);
+            pst.setString(2, sessionHandle);
+            pst.setString(3, jti + ",");
+            pst.setLong(4, exp);
+            pst.setString(5, gid);
+            pst.setString(6, appIdentifier.getAppId());
+        });
+    }
+
     public static void deleteExpiredOAuthSessions(Start start, long exp) throws SQLException, StorageQueryException {
         // delete expired M2M tokens
         String QUERY = "DELETE FROM " + Config.getConfig(start).getOAuthSessionsTable() +
@@ -421,11 +512,21 @@ public class OAuthQueries {
     }
 
     public static void deleteExpiredOAuthM2MTokens(Start start, long exp) throws SQLException, StorageQueryException {
-        // delete expired M2M tokens
+        // Keep draining the legacy per-token table. New tokens no longer land here, so once every
+        // row has aged past the retention window this is a no-op and the table stays empty.
         String QUERY = "DELETE FROM " + Config.getConfig(start).getOAuthM2MTokensTable() +
                 " WHERE exp < ?";
         update(start, QUERY, pst -> {
             pst.setLong(1, exp);
+        });
+
+        // Matching sweep for the rollup: drop buckets whose whole exp hour is past the retention
+        // window. exp_bucket >= iat_bucket always, so an exp_bucket strictly below the cutoff hour
+        // means both buckets predate the window.
+        String STATS_QUERY = "DELETE FROM " + Config.getConfig(start).getOAuthM2MTokenStatsTable() +
+                " WHERE exp_bucket < ?";
+        update(start, STATS_QUERY, pst -> {
+            pst.setLong(1, exp / 3600);
         });
     }
 
@@ -448,9 +549,21 @@ public class OAuthQueries {
 
     public static boolean isOAuthSessionExistsByGID(Start start, AppIdentifier appIdentifier, String gid)
             throws SQLException, StorageQueryException {
+        // Borrow a pool connection and delegate to the connection-scoped twin below, so the query and its
+        // result mapping live in exactly one place (mirrors QueryExecutorTemplate#execute(Start, ...)).
+        try (Connection con = ConnectionPool.getConnection(start)) {
+            return isOAuthSessionExistsByGID(start, con, appIdentifier, gid);
+        }
+    }
+
+    // Connection-scoped variant of the above: runs the existence check on the caller's already-open
+    // transaction connection instead of borrowing a new one from the pool (see OAuthSQLStorage
+    // #isOAuthTokenRevokedByGID_Transaction).
+    public static boolean isOAuthSessionExistsByGID(Start start, Connection con, AppIdentifier appIdentifier, String gid)
+            throws SQLException, StorageQueryException {
         String SELECT = "SELECT count(*) FROM " + Config.getConfig(start).getOAuthSessionsTable()
                 + " WHERE app_id = ? and gid = ?;";
-        return execute(start, SELECT, pst -> {
+        return execute(con, SELECT, pst -> {
             pst.setString(1, appIdentifier.getAppId());
             pst.setString(2, gid);
         }, result -> {

@@ -20,8 +20,14 @@ import com.google.gson.JsonArray;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonPrimitive;
+import io.supertokens.Main;
 import io.supertokens.ProcessState;
 import io.supertokens.authRecipe.AuthRecipe;
+import io.supertokens.config.Config;
+import io.supertokens.cronjobs.CronTaskTest;
+import io.supertokens.multitenancy.MultitenancyHelper;
+import io.supertokens.output.Logging;
+import io.supertokens.cronjobs.rollupUserLastActive.RollupUserLastActive;
 import io.supertokens.emailpassword.EmailPassword;
 import io.supertokens.featureflag.EE_FEATURES;
 import io.supertokens.featureflag.FeatureFlag;
@@ -29,6 +35,7 @@ import io.supertokens.featureflag.FeatureFlagTestContent;
 import io.supertokens.featureflag.exceptions.FeatureNotEnabledException;
 import io.supertokens.featureflag.exceptions.NoLicenseKeyFoundException;
 import io.supertokens.multitenancy.Multitenancy;
+import io.supertokens.pluginInterface.KeyValueInfo;
 import io.supertokens.pluginInterface.STORAGE_TYPE;
 import io.supertokens.pluginInterface.Storage;
 import io.supertokens.pluginInterface.exceptions.StorageQueryException;
@@ -38,16 +45,19 @@ import io.supertokens.session.Session;
 import io.supertokens.storageLayer.StorageLayer;
 import io.supertokens.test.httpRequest.HttpRequestForTesting;
 import io.supertokens.test.multitenant.api.TestMultitenancyAPIHelper;
+import io.supertokens.test.saml.SAMLTestUtils;
 import io.supertokens.webserver.WebserverAPI;
 import org.junit.*;
 import org.junit.rules.TestRule;
 
+import java.io.File;
 import java.util.Arrays;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
 
 import static org.junit.Assert.*;
+import static org.junit.Assume.assumeTrue;
 
 public class FeatureFlagTest {
 
@@ -240,6 +250,8 @@ public class FeatureFlagTest {
 
         // Now check the stats again:
         {
+            // PLAN-011 cutover: the sign-ups' last-active activity reaches the maus projection only via a fold.
+            RollupUserLastActive.runOnceForAllStoragesForTesting(process.getProcess());
             JsonObject response = HttpRequestForTesting.sendGETRequest(process.getProcess(), "",
                     "http://localhost:3567/ee/featureflag",
                     null, 1000, 1000, null, WebserverAPI.getLatestCDIVersion().get(), "");
@@ -284,6 +296,9 @@ public class FeatureFlagTest {
             AuthRecipe.linkAccounts(process.getProcess(), user2.get("user").getAsJsonObject().get("id").getAsString(),
                     user1.get("user").getAsJsonObject().get("id").getAsString());
 
+            // PLAN-011 cutover: fold, then reconcile drops the linked-away recipe user (user2) from the
+            // projection, driven by the account_linking event AuthRecipe.linkAccounts emits.
+            RollupUserLastActive.runOnceForAllStoragesForTesting(process.getProcess());
             JsonObject response = HttpRequestForTesting.sendGETRequest(process.getProcess(), "",
                     "http://localhost:3567/ee/featureflag",
                     null, 1000, 1000, null, WebserverAPI.getLatestCDIVersion().get(), "");
@@ -301,8 +316,12 @@ public class FeatureFlagTest {
 
             assert features.contains(new JsonPrimitive("mfa"));
             assert maus.size() == 31;
-            assert maus.get(0).getAsInt() == 4; // 2 users have signed up
-            assert maus.get(29).getAsInt() == 4;
+            // 4 users signed up (2 here + 2 earlier), but user2 was just linked into user1, so the rollup's
+            // reconcile removes user2's row: the merged pair counts once → 3 distinct active users. Pre-cutover
+            // the direct write left user2's row in place (this internal linkAccounts path never deleted it),
+            // over-counting to 4; the reconcile now applies uniformly to API- and internally-driven linking.
+            assert maus.get(0).getAsInt() == 3;
+            assert maus.get(29).getAsInt() == 3;
 
             {
                 JsonObject mfaStats = usageStats.get("mfa").getAsJsonObject();
@@ -424,9 +443,10 @@ public class FeatureFlagTest {
 
         for (int i = 0; i < 500; i++) {
             TenantIdentifier tenantIdentifier = new TenantIdentifier(null, null, "t" + i);
+            // Use forceReloadResources=false for intermediate tenants to avoid O(n^2) overhead.
+            // Only the last tenant triggers feature flag, signing key, and cronjob reload.
             Multitenancy.addNewOrUpdateAppOrTenant(
                     process.getProcess(),
-                    new TenantIdentifier(null, null, null),
                     new TenantConfig(
                             tenantIdentifier,
                             new EmailPasswordConfig(true),
@@ -434,18 +454,19 @@ public class FeatureFlagTest {
                             new PasswordlessConfig(true),
                             null, null,
                             new JsonObject()
-                    )
+                    ),
+                    false, // shouldPreventProtectedConfigUpdate
+                    true,  // skipThirdPartyConfigValidation
+                    i == 499 // forceReloadResources - only on last iteration
             );
-
-            System.out.println("Added tenant " + i);
         }
 
         long startTime = System.currentTimeMillis();
         JsonObject response = HttpRequestForTesting.sendGETRequest(process.getProcess(), "",
                 "http://localhost:3567/ee/featureflag",
                 null, 5000, 5000, null, WebserverAPI.getLatestCDIVersion().get(), "");
-
         long timeTaken = System.currentTimeMillis() - startTime;
+
         assertTrue(timeTaken < 2500);
         Assert.assertEquals("OK", response.get("status").getAsString());
 
@@ -573,6 +594,58 @@ public class FeatureFlagTest {
 
         process.kill();
         assertNotNull(process.checkOrWaitForEvent(ProcessState.PROCESS_STATE.STOPPED));
+    }
+
+    // The license-usage stats come from the user-count pipeline: the tenant's full count, stored in the database and
+    // shared by every core, plus the lifecycle events since it - so a sign-up shows at once, without a new full count.
+    @Test
+    public void multitenantStatsUseTheStoredUserCount() throws Exception {
+        String[] args = {"../"};
+
+        TestingProcessManager.TestingProcess process = TestingProcessManager.startIsolatedProcess(args);
+        assertNotNull(process.checkOrWaitForEvent(ProcessState.PROCESS_STATE.STARTED));
+
+        if (StorageLayer.getStorage(process.getProcess()).getType() != STORAGE_TYPE.SQL
+                || StorageLayer.isInMemDb(process.getProcess())) { // the in-memory db counts directly, stores nothing
+            process.kill();
+            assertNotNull(process.checkOrWaitForEvent(ProcessState.PROCESS_STATE.STOPPED));
+            return;
+        }
+
+        FeatureFlag.getInstance(process.getProcess()).setLicenseKeyAndSyncFeatures(OPAQUE_KEY_WITH_MULTITENANCY_FEATURE);
+
+        TenantIdentifier t0 = new TenantIdentifier(null, null, "t0");
+        Multitenancy.addNewOrUpdateAppOrTenant(process.getProcess(), new TenantIdentifier(null, null, null),
+                new TenantConfig(t0, new EmailPasswordConfig(true), new ThirdPartyConfig(true, null),
+                        new PasswordlessConfig(true), null, null, new JsonObject()));
+        Storage storage = StorageLayer.getStorage(t0, process.getProcess());
+        EmailPassword.signUp(t0, storage, process.getProcess(), "user1@example.com", "password");
+        EmailPassword.signUp(t0, storage, process.getProcess(), "user2@example.com", "password");
+
+        assertEquals(2, getTenantUsersCountStat(process, "t0"));
+        KeyValueInfo stored = storage.getKeyValue(t0, "TENANT_USERS_COUNT");
+        assertNotNull(stored);
+        assertEquals("2", stored.value);
+
+        // A sign-up is added from the lifecycle events; the stored full count is not redone
+        EmailPassword.signUp(t0, storage, process.getProcess(), "user3@example.com", "password");
+        assertEquals(3, getTenantUsersCountStat(process, "t0"));
+        assertEquals("2", storage.getKeyValue(t0, "TENANT_USERS_COUNT").value);
+
+        process.kill();
+        assertNotNull(process.checkOrWaitForEvent(ProcessState.PROCESS_STATE.STOPPED));
+    }
+
+    private static long getTenantUsersCountStat(TestingProcessManager.TestingProcess process, String tenantId)
+            throws Exception {
+        JsonArray tenantStats = FeatureFlag.getInstance(process.getProcess()).getPaidFeatureStats()
+                .get(EE_FEATURES.MULTI_TENANCY.toString()).getAsJsonObject().get("tenants").getAsJsonArray();
+        for (JsonElement tenantStat : tenantStats) {
+            if (tenantStat.getAsJsonObject().get("tenantId").getAsString().equals(tenantId)) {
+                return tenantStat.getAsJsonObject().get("usersCount").getAsLong();
+            }
+        }
+        throw new AssertionError("no multi_tenancy stats for tenant " + tenantId);
     }
 
     @Test
@@ -865,7 +938,7 @@ public class FeatureFlagTest {
     }
 
     @Test
-    public void testNetworkCallIsMadeInCoreInit() throws Exception {
+    public void testNetworkCallIsMadeByCronAfterCoreInitNotDuringBoot() throws Exception {
         String[] args = {"../"};
 
         TestingProcessManager.TestingProcess process = TestingProcessManager.startIsolatedProcess(args);
@@ -888,10 +961,23 @@ public class FeatureFlagTest {
         process.kill(false);
 
 
-        // Restart core and check if the call was made during init
-        process = TestingProcessManager.startIsolatedProcess(args);
+        // Restart core. The license sync no longer runs synchronously in EEFeatureFlag's constructor on the
+        // boot thread; the EELicenseCheck cron performs it shortly after startup instead. Pin the cron's
+        // (jittered) initial delay to 10s via the CronTaskTest initial-wait seam so this is deterministic. We
+        // pin the initial wait rather than the interval so the "no call within 1000ms" window below has a wide
+        // (~10s), boot-order-independent margin, and the daily interval stays untouched (the cron won't loop).
+        process = TestingProcessManager.startIsolatedProcess(args, false);
+        // EELicenseCheck.RESOURCE_KEY lives in the ee module, which is not on this (core) test's compile
+        // classpath, so refer to it by its literal resource-key string.
+        CronTaskTest.getInstance(process.getProcess())
+                .setInitialWaitTimeInSeconds("io.supertokens.ee.cronjobs.EELicenseCheck", 10);
         process.startProcess();
         assertNotNull(process.checkOrWaitForEvent(ProcessState.PROCESS_STATE.STARTED));
+
+        // No synchronous license-server call during boot...
+        assertNull(process.checkOrWaitForEvent(ProcessState.PROCESS_STATE.LICENSE_KEY_CHECK_NETWORK_CALL, 1000));
+
+        // ...but the cron performs it once its initial delay elapses.
         assertNotNull(process.checkOrWaitForEvent(ProcessState.PROCESS_STATE.LICENSE_KEY_CHECK_NETWORK_CALL));
 
         process.kill();
@@ -962,8 +1048,12 @@ public class FeatureFlagTest {
 
             process.kill(false);
 
-            // Restart core and check if the call was made during init
-            process = TestingProcessManager.startIsolatedProcess(args);
+            // Restart core. The license sync (and its usage-stats report) now runs on the EELicenseCheck
+            // cron shortly after startup rather than synchronously in EEFeatureFlag's constructor, so pin
+            // the cron's initial delay to 1s and read the stats off that call.
+            process = TestingProcessManager.startIsolatedProcess(args, false);
+            CronTaskTest.getInstance(process.getProcess())
+                    .setIntervalInSeconds("io.supertokens.ee.cronjobs.EELicenseCheck", 1);
             process.startProcess();
             assertNotNull(process.checkOrWaitForEvent(ProcessState.PROCESS_STATE.STARTED));
             ProcessState.EventAndException event = process.checkOrWaitForEvent(
@@ -986,5 +1076,143 @@ public class FeatureFlagTest {
         }
 
         assertEquals(requiredFeatures, foundFeatures);
+    }
+
+    @Test
+    public void testSAMLStatsContainTenantStats() throws Exception {
+        String[] args = {"../"};
+
+        TestingProcessManager.TestingProcess process = TestingProcessManager.startIsolatedProcess(args);
+        assertNotNull(process.checkOrWaitForEvent(ProcessState.PROCESS_STATE.STARTED));
+
+        if (StorageLayer.getStorage(process.getProcess()).getType() != STORAGE_TYPE.SQL) {
+            return;
+        }
+
+        FeatureFlag.getInstance(process.getProcess()).setLicenseKeyAndSyncFeatures(OPAQUE_KEY_WITH_SAML_FEATURE);
+
+        SAMLTestUtils.createClientWithGeneratedMetadata(process, "http://localhost:3000/callback",
+                "http://localhost:3567/recipe/saml/callback", "https://saml.example.com/entity-1",
+                "https://mocksaml.com/api/saml/sso");
+        SAMLTestUtils.createClientWithGeneratedMetadata(process, "http://localhost:3000/callback2",
+                "http://localhost:3567/recipe/saml/callback", "https://saml.example.com/entity-2",
+                "https://mocksaml.com/api/saml/sso");
+
+        JsonObject stats = FeatureFlag.getInstance(process.getProcess()).getPaidFeatureStats();
+        assertTrue(stats.has("saml"));
+        JsonObject samlStats = stats.get("saml").getAsJsonObject();
+
+        // regression: "tenants" used to always be an empty array because the per-tenant stat
+        // object was added to itself instead of being appended to the array
+        JsonArray tenants = samlStats.get("tenants").getAsJsonArray();
+        assertEquals(1, tenants.size());
+
+        JsonObject publicTenantStat = tenants.get(0).getAsJsonObject();
+        assertEquals("public", publicTenantStat.get("tenantId").getAsString());
+        assertEquals(2,
+                publicTenantStat.get("public").getAsJsonObject().get("numberOfSAMLClients").getAsInt());
+
+        process.kill();
+        assertNotNull(process.checkOrWaitForEvent(ProcessState.PROCESS_STATE.STOPPED));
+    }
+
+    // Regression for #1423 (PLAN-013 unit 1): a per-app FeatureFlag construction failure during a
+    // resource reload must keep that app's previous resource instead of dropping it. Before the fix,
+    // replaceResourcesWithResourceKey wiped the app's resource and every later /ee/license call and
+    // feature gate threw TenantOrAppNotFoundException.
+    @Test
+    public void constructionFailureKeepsPreviousResourceAndLicenseStillWorks() throws Exception {
+        String[] args = {"../"};
+        TestingProcessManager.TestingProcess process = TestingProcessManager.startIsolatedProcess(args);
+        assertNotNull(process.checkOrWaitForEvent(ProcessState.PROCESS_STATE.STARTED));
+        Main main = process.getProcess();
+
+        if (StorageLayer.getStorage(main).getType() != STORAGE_TYPE.SQL) {
+            return;
+        }
+
+        AppIdentifier baseApp = new AppIdentifier(null, null);
+
+        // the base app's FeatureFlag resource is loaded at boot
+        FeatureFlag before = FeatureFlag.getInstance(main, baseApp);
+        assertNotNull(before);
+
+        // arm the hook so reconstructing the base app's FeatureFlag throws (with a null-message exception)
+        FeatureFlagTestContent.getInstance(main).setKeyValue(
+                FeatureFlagTestContent.FAIL_CONSTRUCTOR_FOR_APPS,
+                new HashSet<>(Arrays.asList(baseApp.getAppId())));
+
+        // trigger a reload that touches the base app -> construction throws for it
+        MultitenancyHelper.getInstance(main).forceReloadAllResources(
+                Arrays.asList(baseApp.getAsPublicTenantIdentifier()));
+
+        // the previous resource must still be present (not wiped) and be the SAME instance
+        FeatureFlag after = FeatureFlag.getInstance(main, baseApp); // must NOT throw TenantOrAppNotFoundException
+        assertSame(before, after);
+
+        // /ee/license-backed calls keep working (no TenantOrAppNotFoundException)
+        after.getPaidFeatureStats();
+        after.getEnabledFeatures();
+
+        // once the failure clears, a reload reconstructs a fresh instance
+        FeatureFlagTestContent.getInstance(main).setKeyValue(
+                FeatureFlagTestContent.FAIL_CONSTRUCTOR_FOR_APPS, new HashSet<String>());
+        MultitenancyHelper.getInstance(main).forceReloadAllResources(
+                Arrays.asList(baseApp.getAsPublicTenantIdentifier()));
+        FeatureFlag reloaded = FeatureFlag.getInstance(main, baseApp);
+        assertNotSame(before, reloaded);
+
+        process.kill();
+        assertNotNull(process.checkOrWaitForEvent(ProcessState.PROCESS_STATE.STOPPED));
+    }
+
+    // Regression for #1423 (PLAN-013 unit 1): Logging.error must not swallow a null-message exception
+    // (the 4-arg overload used to NPE on err.trim() inside catch(NullPointerException), logging
+    // nothing). The 5-arg overload must log the exception's class name + stack trace when the message
+    // is null.
+    @Test
+    public void nullMessageExceptionIsLoggedWithStackTraceAndNotSwallowed() throws Exception {
+        assumeTrue("File logging is disabled via environment variable", Utils.isFileLoggingEnabled());
+
+        String[] args = {"../"};
+        TestingProcessManager.TestingProcess process = TestingProcessManager.startIsolatedProcess(args);
+        assertNotNull(process.checkOrWaitForEvent(ProcessState.PROCESS_STATE.STARTED));
+        Main main = process.getProcess();
+
+        // The error log file is shared/appended across isolated test processes, so only scan the
+        // bytes appended by this test (past the current end of file).
+        File errorLog = new File(Config.getConfig(main).getErrorLogPath(main));
+        long offset = errorLog.exists() ? errorLog.length() : 0;
+
+        // 5-arg overload: an exception whose getMessage() is null must still be logged, with its
+        // class name (fallback) and stack trace, instead of being swallowed.
+        RuntimeException nullMsgException = new RuntimeException();
+        assertNull(nullMsgException.getMessage());
+        Logging.error(main, new TenantIdentifier(null, null, null), null, false, nullMsgException);
+
+        // 4-arg overload: a null message must not NPE-and-swallow; it should still log a line for
+        // the (distinctive) tenant.
+        Logging.error(main, new TenantIdentifier(null, "nullmsg4argapp", null), null, false);
+
+        boolean sawStackTrace = false;
+        boolean saw4ArgTenant = false;
+        try (java.io.RandomAccessFile raf = new java.io.RandomAccessFile(errorLog, "r")) {
+            raf.seek(offset);
+            String line;
+            while ((line = raf.readLine()) != null) {
+                if (line.contains("java.lang.RuntimeException")) {
+                    sawStackTrace = true;
+                }
+                if (line.contains("nullmsg4argapp")) {
+                    saw4ArgTenant = true;
+                }
+            }
+        }
+        assertTrue("null-message exception should be logged with its class name / stack trace",
+                sawStackTrace);
+        assertTrue("null message (4-arg) should still be logged, not swallowed", saw4ArgTenant);
+
+        process.kill();
+        assertNotNull(process.checkOrWaitForEvent(ProcessState.PROCESS_STATE.STOPPED));
     }
 }

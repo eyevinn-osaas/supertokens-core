@@ -45,6 +45,7 @@ import java.util.Arrays;
 import java.util.List;
 import java.util.UUID;
 import java.util.regex.Pattern;
+import io.supertokens.auditlog.UnauditedTransaction;
 
 public class Dashboard {
     public static final int MAX_NUMBER_OF_FREE_DASHBOARD_USERS = 3;
@@ -231,6 +232,7 @@ public class Dashboard {
         }
     }
 
+    @UnauditedTransaction(justification = "Legacy unaudited transaction (PLAN-012 backlog); pending conversion to startAuditedTransaction or read-only exemption.")
     public static DashboardUser updateUsersCredentialsWithUserId(AppIdentifier appIdentifier, Storage storage,
                                                                  Main main, String userId,
                                                                  String newEmail,
@@ -399,6 +401,14 @@ public class Dashboard {
         DashboardSessionInfo sessionInfo = StorageUtils.getDashboardStorage(storage)
                 .getSessionInfoWithSessionId(appIdentifier, sessionId);
         if (sessionInfo != null) {
+            // Enforce the session lifetime at verification time. The DeleteExpiredDashboardSessions cron
+            // only reclaims rows, and does not run for the first 12 hours of a process' life, so it cannot
+            // be relied on to end a session. Revoke the expired row here so it stops authenticating even on
+            // a core that restarts more often than the cron interval.
+            if (isSessionExpired(sessionInfo)) {
+                revokeSessionWithSessionId(appIdentifier, storage, sessionId);
+                return false;
+            }
             // check if user is suspended
             if (isUserSuspended(appIdentifier, storage, main, null, sessionInfo.userId)) {
                 throw new UserSuspendedException();
@@ -408,12 +418,16 @@ public class Dashboard {
         return false;
     }
 
+    private static boolean isSessionExpired(DashboardSessionInfo sessionInfo) {
+        return sessionInfo.expiry <= System.currentTimeMillis();
+    }
+
     public static String getEmailFromSessionId(AppIdentifier appIdentifier, Storage storage, String sessionId)
             throws StorageQueryException {
         DashboardSessionInfo sessionInfo = StorageUtils.getDashboardStorage(storage)
                 .getSessionInfoWithSessionId(appIdentifier, sessionId);
 
-        if (sessionInfo != null) {
+        if (sessionInfo != null && !isSessionExpired(sessionInfo)) {
             String userId = sessionInfo.userId;
 
             DashboardUser user = StorageUtils.getDashboardStorage(storage)

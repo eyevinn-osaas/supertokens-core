@@ -47,7 +47,10 @@ import java.io.IOException;
 import java.net.ConnectException;
 import java.net.InetAddress;
 import java.net.SocketTimeoutException;
+import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
+import java.util.List;
 
 import static org.junit.Assert.*;
 
@@ -259,6 +262,30 @@ public class WebserverTest extends Mockito {
                     "Http error. Status Code: 400. Message: cdi-version " + unsupportedCdiVersion + " not supported");
         }
 
+    }
+
+    // * - Give a cdi-version that is not in a valid version format and make sure it results in a
+    // 400 (it used to surface as a 500 from the SemVer constructor)
+    @Test
+    public void testInvalidVersionFormat() throws Exception {
+        String[] args = {"../"};
+
+        TestingProcess process = TestingProcessManager.startIsolatedProcess(args);
+        assertNotNull(process.checkOrWaitForEvent(PROCESS_STATE.STARTED));
+
+        for (String invalidCdiVersion : new String[]{"abc", "2.x", "1..0", "2,7"}) {
+            try {
+                HttpRequestForTesting.sendGETRequest(process.getProcess(), "",
+                        "http://localhost:3567/hello", null, 1000, 1000, null, invalidCdiVersion, "");
+                fail();
+            } catch (io.supertokens.test.httpRequest.HttpResponseException e) {
+                assertEquals("Http error. Status Code: 400. Message: cdi-version header is invalid",
+                        e.getMessage());
+            }
+        }
+
+        process.kill();
+        assertNotNull(process.checkOrWaitForEvent(PROCESS_STATE.STOPPED));
     }
 
     // * - Give no version and makes sure it treats it as the latest
@@ -1146,6 +1173,52 @@ public class WebserverTest extends Mockito {
         };
 
         return new RecipeRouter(process.getProcess(), recipe_1_api, recipe_2_api);
+    }
+
+    // The test-only request observer sees each request start and end on the servlet thread that handles it, and is
+    // no longer called once cleared.
+    @Test
+    public void testRequestObserverBracketsEachRequestOnItsServletThread() throws Exception {
+        String[] args = {"../"};
+        TestingProcess process = TestingProcessManager.start(args);
+        assertNotNull(process.checkOrWaitForEvent(PROCESS_STATE.STARTED));
+
+        List<String> events = Collections.synchronizedList(new ArrayList<>());
+        WebserverAPI.RequestObserver observer = new WebserverAPI.RequestObserver() {
+            @Override
+            public void onRequestStart(HttpServletRequest req) {
+                events.add("start " + req.getRequestURI() + " on " + Thread.currentThread().getId());
+            }
+
+            @Override
+            public void onRequestEnd(HttpServletRequest req) {
+                events.add("end " + req.getRequestURI() + " on " + Thread.currentThread().getId());
+            }
+        };
+        assertNull(WebserverAPI.setRequestObserverForTesting(observer));
+        try {
+            HttpRequestForTesting.sendGETRequest(process.getProcess(), "", "http://localhost:3567/hello", null, 1000,
+                    1000, null, Utils.getCdiVersionStringLatestForTests(), null);
+            // the server can send the response before its service() returns
+            long deadline = System.currentTimeMillis() + 10_000;
+            while (events.size() < 2 && System.currentTimeMillis() < deadline) {
+                Thread.sleep(10);
+            }
+        } finally {
+            assertSame(observer, WebserverAPI.setRequestObserverForTesting(null));
+        }
+        assertEquals(events.toString(), 2, events.size());
+        String thread = events.get(0).substring(events.get(0).indexOf(" on "));
+        assertTrue(events.toString(), events.get(0).startsWith("start /") && events.get(0).contains("/hello"));
+        assertTrue(events.toString(), events.get(1).startsWith("end /") && events.get(1).endsWith("/hello" + thread));
+
+        HttpRequestForTesting.sendGETRequest(process.getProcess(), "", "http://localhost:3567/hello", null, 1000,
+                1000, null, Utils.getCdiVersionStringLatestForTests(), null);
+        Thread.sleep(200);
+        assertEquals(events.toString(), 2, events.size());
+
+        process.kill();
+        assertNotNull(process.checkOrWaitForEvent(PROCESS_STATE.STOPPED));
     }
 
     private static class ThreadPoolTester implements Runnable {

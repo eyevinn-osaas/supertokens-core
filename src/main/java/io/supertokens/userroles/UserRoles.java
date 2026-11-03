@@ -34,6 +34,7 @@ import org.jetbrains.annotations.TestOnly;
 
 import javax.annotation.Nullable;
 import java.util.*;
+import io.supertokens.auditlog.UnauditedTransaction;
 
 public class UserRoles {
     // add a role to a user and return true, if the role is already mapped to the user return false, but if
@@ -59,6 +60,7 @@ public class UserRoles {
         }
     }
 
+    @UnauditedTransaction(justification = "Legacy unaudited transaction (PLAN-012 backlog); pending conversion to startAuditedTransaction or read-only exemption.")
     public static void addMultipleRolesToMultipleUsers(Main main, AppIdentifier appIdentifier, Storage storage,
                                                        Map<TenantIdentifier, Map<String, List<String>>> rolesToUserByTenant)
             throws StorageTransactionLogicException, TenantOrAppNotFoundException {
@@ -124,6 +126,7 @@ public class UserRoles {
     // create a new role if it doesn't exist and add permissions to the role. This will create the role
     // in the user pool associated with the tenant used to query this API, so that this role can then
     // be shared across any tenant in that same user pool.
+    @UnauditedTransaction(justification = "Legacy unaudited transaction (PLAN-012 backlog); pending conversion to startAuditedTransaction or read-only exemption.")
     public static boolean createNewRoleOrModifyItsPermissions(AppIdentifier appIdentifier, Storage storage,
                                                               String role, String[] permissions)
             throws StorageQueryException, StorageTransactionLogicException, TenantOrAppNotFoundException {
@@ -184,38 +187,36 @@ public class UserRoles {
     }
 
     // remove a role mapped to a user, if the role doesn't exist throw a UNKNOWN_ROLE_EXCEPTION error
-    public static boolean removeUserRole(TenantIdentifier tenantIdentifier, Storage storage, String userId,
+    @UnauditedTransaction(justification = "Legacy unaudited transaction (PLAN-012 backlog); pending conversion to startAuditedTransaction or read-only exemption.")
+    public static boolean removeUserRole(Main main, TenantIdentifier tenantIdentifier, Storage storage, String userId,
                                          String role)
-            throws StorageQueryException, StorageTransactionLogicException, UnknownRoleException {
+            throws StorageQueryException, StorageTransactionLogicException, UnknownRoleException,
+            TenantOrAppNotFoundException {
+
+        // Roles are stored in public tenant storage and role to user mapping is stored in the tenant's storage
+        // We do this because it's not straight forward to replicate roles to all storages of an app
+        // The role existence check must resolve against the app (public tenant) storage, the same way
+        // addRoleToUser does, so that a role created and granted against the app storage can also be
+        // removed when the tenant is backed by its own storage.
+        Storage appStorage = StorageLayer.getStorage(
+                tenantIdentifier.toAppIdentifier().getAsPublicTenantIdentifier(), main);
+        if (!doesRoleExist(tenantIdentifier.toAppIdentifier(), appStorage, role)) {
+            throw new UnknownRoleException();
+        }
 
         UserRolesSQLStorage userRolesStorage = StorageUtils.getUserRolesStorage(storage);
 
-        try {
-            return userRolesStorage.startTransaction(con -> {
-
-                boolean doesRoleExist = userRolesStorage.doesRoleExist_Transaction(
-                        tenantIdentifier.toAppIdentifier(), con, role);
-
-                if (doesRoleExist) {
-                    return userRolesStorage.deleteRoleForUser_Transaction(tenantIdentifier, con, userId, role);
-                } else {
-                    throw new StorageTransactionLogicException(new UnknownRoleException());
-                }
-            });
-        } catch (StorageTransactionLogicException e) {
-            if (e.actualException instanceof UnknownRoleException) {
-                throw (UnknownRoleException) e.actualException;
-            }
-            throw e;
-        }
+        return userRolesStorage.startTransaction(con ->
+                userRolesStorage.deleteRoleForUser_Transaction(tenantIdentifier, con, userId, role));
     }
 
     @TestOnly
     public static boolean removeUserRole(Main main, String userId, String role)
-            throws StorageQueryException, StorageTransactionLogicException, UnknownRoleException {
+            throws StorageQueryException, StorageTransactionLogicException, UnknownRoleException,
+            TenantOrAppNotFoundException {
         Storage storage = StorageLayer.getStorage(main);
         return removeUserRole(
-                ResourceDistributor.getAppForTesting(), storage,
+                main, ResourceDistributor.getAppForTesting(), storage,
                 userId, role);
     }
 
@@ -277,6 +278,7 @@ public class UserRoles {
     }
 
     // delete permissions from a role, if the role doesn't exist throw an UNKNOWN_ROLE_EXCEPTION
+    @UnauditedTransaction(justification = "Legacy unaudited transaction (PLAN-012 backlog); pending conversion to startAuditedTransaction or read-only exemption.")
     public static void deletePermissionsFromRole(AppIdentifier appIdentifier, Storage storage, String role,
                                                  @Nullable String[] permissions)
             throws StorageQueryException, StorageTransactionLogicException, UnknownRoleException {

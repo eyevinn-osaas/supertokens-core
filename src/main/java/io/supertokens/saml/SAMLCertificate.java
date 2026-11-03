@@ -50,8 +50,10 @@ import java.security.spec.PKCS8EncodedKeySpec;
 import java.security.spec.X509EncodedKeySpec;
 import java.util.Base64;
 import java.util.Date;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import io.supertokens.auditlog.UnauditedTransaction;
 
 public class SAMLCertificate extends ResourceDistributor.SingletonResource {
     private static final String RESOURCE_KEY = "io.supertokens.saml.SAMLCertificate";
@@ -61,6 +63,11 @@ public class SAMLCertificate extends ResourceDistributor.SingletonResource {
     private static final String SAML_KEY_PAIR_NAME = "saml_key_pair";
     private static final String SAML_CERTIFICATE_NAME = "saml_certificate";
 
+    // Static test certificate - generated once per JVM with smaller key size for speed
+    private static volatile KeyPair staticTestKeyPair = null;
+    private static volatile X509Certificate staticTestCertificate = null;
+    private static final Object staticTestLock = new Object();
+
     private KeyPair spKeyPair = null;
     private X509Certificate spCertificate = null;
 
@@ -69,8 +76,9 @@ public class SAMLCertificate extends ResourceDistributor.SingletonResource {
         this.main = main;
         this.appIdentifier = appIdentifier;
         try {
-            if (!Main.isTesting) {
-                // Creation of new certificate is slow, not really necessary to create one for each test
+            // Creation of new certificate is slow, not really necessary to create one for each test. Querying a
+            // storage that is still initialising would wait for it; getCertificate() loads it on first use.
+            if (!Main.isTesting && !StorageLayer.isStorageStillInitialising(main, appIdentifier)) {
                 this.getCertificate();
             }
         } catch (StorageQueryException | TenantOrAppNotFoundException | RuntimeException e) {
@@ -81,6 +89,12 @@ public class SAMLCertificate extends ResourceDistributor.SingletonResource {
 
     public synchronized X509Certificate getCertificate()
             throws StorageQueryException, TenantOrAppNotFoundException {
+        // In testing mode, use static test certificate (generated once per JVM, with smaller key size)
+        if (Main.isTesting) {
+            ensureStaticTestCertificateExists();
+            return staticTestCertificate;
+        }
+
         if (this.spCertificate == null || this.spCertificate.getNotAfter().before(new Date())) {
             maybeGenerateNewCertificateAndUpdateInDb();
         }
@@ -94,6 +108,12 @@ public class SAMLCertificate extends ResourceDistributor.SingletonResource {
      */
     public synchronized PrivateKey getPrivateKey()
             throws StorageQueryException, TenantOrAppNotFoundException {
+        // In testing mode, use static test certificate (generated once per JVM, with smaller key size)
+        if (Main.isTesting) {
+            ensureStaticTestCertificateExists();
+            return staticTestKeyPair.getPrivate();
+        }
+
         if (this.spKeyPair == null || this.spCertificate == null || this.spCertificate.getNotAfter().before(new Date())) {
             maybeGenerateNewCertificateAndUpdateInDb();
         }
@@ -101,6 +121,74 @@ public class SAMLCertificate extends ResourceDistributor.SingletonResource {
         return this.spKeyPair.getPrivate();
     }
 
+    /**
+     * Ensures the static test certificate exists, generating it once per JVM if needed.
+     * Uses 2048-bit keys instead of 4096-bit for faster generation.
+     */
+    private static void ensureStaticTestCertificateExists() {
+        if (staticTestCertificate != null) {
+            return;
+        }
+        synchronized (staticTestLock) {
+            if (staticTestCertificate != null) {
+                return;
+            }
+            try {
+                // Generate with smaller key size for speed (2048 instead of 4096)
+                KeyPairGenerator keyGen = KeyPairGenerator.getInstance("RSA");
+                keyGen.initialize(2048);
+                staticTestKeyPair = keyGen.generateKeyPair();
+                staticTestCertificate = generateSelfSignedCertificateForKeyPair(staticTestKeyPair);
+            } catch (Exception e) {
+                throw new RuntimeException("Failed to generate static test certificate", e);
+            }
+        }
+    }
+
+    private static X509Certificate generateSelfSignedCertificateForKeyPair(KeyPair keyPair)
+            throws CertIOException, OperatorCreationException, CertificateException {
+        Date notBefore = new Date();
+        Date notAfter = new Date(notBefore.getTime() + 10 * 365L * 24 * 60 * 60 * 1000); // 10 year validity
+
+        X500Name subject = new X500Name("CN=SAML-SP-TEST, O=SuperTokens, C=US");
+        X500Name issuer = subject;
+
+        SecureRandom random = new SecureRandom();
+        java.math.BigInteger serialNumber = new java.math.BigInteger(128, random);
+
+        JcaX509v3CertificateBuilder certBuilder = new JcaX509v3CertificateBuilder(
+                issuer, serialNumber, notBefore, notAfter, subject, keyPair.getPublic());
+
+        KeyUsage keyUsage = new KeyUsage(KeyUsage.digitalSignature | KeyUsage.keyEncipherment);
+        certBuilder.addExtension(Extension.keyUsage, true, keyUsage);
+
+        BasicConstraints basicConstraints = new BasicConstraints(false);
+        certBuilder.addExtension(Extension.basicConstraints, true, basicConstraints);
+
+        ContentSigner contentSigner = new JcaContentSignerBuilder("SHA256withRSA")
+                .build(keyPair.getPrivate());
+
+        X509CertificateHolder certHolder = certBuilder.build(contentSigner);
+        JcaX509CertificateConverter converter = new JcaX509CertificateConverter();
+        return converter.getCertificate(certHolder);
+    }
+
+    /**
+     * Warm-up method for SAML tests. Call this during test setup to pre-initialize
+     * the OpenSAML library and test certificate, ensuring predictable timing during actual tests.
+     * This method is idempotent and safe to call multiple times.
+     */
+    public static void warmUpForTesting() {
+        if (!Main.isTesting) {
+            return;
+        }
+        // Initialize OpenSAML library
+        SAMLBootstrap.initialize();
+        // Pre-generate the static test certificate
+        ensureStaticTestCertificateExists();
+    }
+
+    @UnauditedTransaction(justification = "System signing-key or certificate housekeeping; no user-facing state change to audit.")
     private void maybeGenerateNewCertificateAndUpdateInDb() throws TenantOrAppNotFoundException {
          SQLStorage storage = (SQLStorage) StorageLayer.getStorage(
                 this.appIdentifier.getAsPublicTenantIdentifier(), main);
@@ -289,33 +377,26 @@ public class SAMLCertificate extends ResourceDistributor.SingletonResource {
 
     public static void loadForAllTenants(Main main, List<AppIdentifier> apps,
                                          List<TenantIdentifier> tenantsThatChanged) {
-        try {
-            main.getResourceDistributor().withResourceDistributorLock(() -> {
-                Map<ResourceDistributor.KeyClass, ResourceDistributor.SingletonResource> existingResources =
-                        main.getResourceDistributor()
-                                .getAllResourcesWithResourceKey(RESOURCE_KEY);
-                main.getResourceDistributor().clearAllResourcesWithResourceKey(RESOURCE_KEY);
-                for (AppIdentifier app : apps) {
-                    ResourceDistributor.SingletonResource resource = existingResources.get(
-                            new ResourceDistributor.KeyClass(app, RESOURCE_KEY));
-                    if (resource != null && !tenantsThatChanged.contains(app.getAsPublicTenantIdentifier())) {
-                        main.getResourceDistributor().setResource(app, RESOURCE_KEY,
-                                resource);
-                    } else {
-                        try {
-                            main.getResourceDistributor()
-                                    .setResource(app, RESOURCE_KEY,
-                                            new SAMLCertificate(app, main));
-                        } catch (TenantOrAppNotFoundException e) {
-                            Logging.error(main, app.getAsPublicTenantIdentifier(), e.getMessage(), false);
-                            // continue loading other resources
-                        }
-                    }
+        Map<ResourceDistributor.KeyClass, ResourceDistributor.SingletonResource> existingResources =
+                main.getResourceDistributor()
+                        .getAllResourcesWithResourceKey(RESOURCE_KEY);
+        Map<ResourceDistributor.KeyClass, ResourceDistributor.SingletonResource> newResources =
+                new HashMap<>();
+        for (AppIdentifier app : apps) {
+            ResourceDistributor.SingletonResource resource = existingResources.get(
+                    new ResourceDistributor.KeyClass(app, RESOURCE_KEY));
+            if (resource != null && !tenantsThatChanged.contains(app.getAsPublicTenantIdentifier())) {
+                newResources.put(new ResourceDistributor.KeyClass(app, RESOURCE_KEY), resource);
+            } else {
+                try {
+                    newResources.put(new ResourceDistributor.KeyClass(app, RESOURCE_KEY),
+                            new SAMLCertificate(app, main));
+                } catch (TenantOrAppNotFoundException e) {
+                    Logging.error(main, app.getAsPublicTenantIdentifier(), e.getMessage(), false);
+                    // continue loading other resources
                 }
-                return null;
-            });
-        } catch (ResourceDistributor.FuncException e) {
-            throw new IllegalStateException("should never happen", e);
+            }
         }
+        main.getResourceDistributor().replaceResourcesWithResourceKey(RESOURCE_KEY, newResources);
     }
 }

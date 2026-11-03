@@ -55,7 +55,10 @@ public class CoreConfig {
     // @EnumProperty: The property has fixed set of values (like an enum)
     // @ConfigYamlOnly: The property is configurable only from the config.yaml file.
     // @NotConflictingInApp: The property cannot have different values for tenants within an app
-    // @IgnoreForAnnotationCheck: Set this if the property is neither @ConfigYamlOnly nor @NotConflictingInApp, or should
+    // @NotConflictingInConnectionUriDomain: The property cannot have different values for any app/tenant within a
+    // connection URI domain
+    // @IgnoreForAnnotationCheck: Set this if the property is neither @ConfigYamlOnly nor @NotConflictingInApp nor
+    // @NotConflictingInConnectionUriDomain, or should
     // simply be ignored by the test (if the property is just an internal member and not an exposed config) that checks
     // for annotations on all properties.
     // @HideFromDashboard: The property should not be shown in the dashboard
@@ -68,7 +71,10 @@ public class CoreConfig {
             "oauth_provider_admin_service_url",
             "oauth_provider_consent_login_base_url",
             "oauth_provider_url_configured_in_oauth_provider",
-            "saml_legacy_acs_url"
+            "saml_legacy_acs_url",
+            "activity_log_retention_days",
+            "activity_log_throttle_enabled",
+            "max_concurrent_requests_per_cud"
     };
 
     @IgnoreForAnnotationCheck
@@ -96,6 +102,62 @@ public class CoreConfig {
     @JsonProperty
     @ConfigDescription("Time in mins for how long a refresh token is valid for. [Default: 60 * 2400 (100 days)]")
     private double refresh_token_validity = 60 * 2400; // in mins
+
+    @EnvName("REFRESH_TOKEN_ROTATION_GRACE_PERIOD")
+    @NotConflictingInApp
+    @JsonProperty
+    @ConfigDescription(
+            "Time in seconds for how long the previously active refresh token remains accepted after a rotation. "
+                    + "[Default: 30]")
+    private int refresh_token_rotation_grace_period = 30; // in seconds
+
+    @EnvName("ACCESS_TOKEN_VALIDITY_JITTER")
+    @NotConflictingInApp
+    @JsonProperty
+    @ConfigDescription(
+            "Fraction between 0 and 0.25 by which access token validity is randomly shortened at issuance. Applied "
+                    + "subtractively so the token expiry is never lengthened. Set to 0 to disable. [Default: 0.05]")
+    private double access_token_validity_jitter = 0.05;
+
+    @EnvName("RECENT_TOKEN_REUSE_BEHAVIOUR")
+    @ConfigYamlOnly
+    @JsonProperty
+    @ConfigDescription(
+            "How the reuse of a recently rotated-out refresh token is reported. Values are \"TOKEN_THEFT\" | "
+                    + "\"UNAUTHORISED\". The session is revoked regardless of this setting. (Default: TOKEN_THEFT)")
+    @EnumProperty({"TOKEN_THEFT", "UNAUTHORISED"})
+    private String recent_token_reuse_behaviour = "TOKEN_THEFT";
+
+    @EnvName("SCHEMA_CHECK_STRICT_MODE")
+    @ConfigYamlOnly
+    @JsonProperty
+    @ConfigDescription(
+            "If true, the core refuses to start when the base database is missing tables or columns this version "
+                    + "needs (a skipped manual migration), and tenant databases with a mismatched schema are not "
+                    + "served. If false, mismatches are only logged and just the queries touching the missing "
+                    + "schema fail. (Default: true)")
+    private boolean schema_check_strict_mode = true;
+
+    @EnvName("STORAGE_INIT_TIMEOUT_SECONDS")
+    @ConfigYamlOnly
+    @JsonProperty
+    @ConfigDescription(
+            "How long (seconds) the core waits at startup for a tenant storage to initialise, counted from when its "
+                    + "own initialisation starts. A storage that takes longer is logged as an error and startup "
+                    + "continues without it, while it keeps initialising in the background. The base storage is "
+                    + "always waited for. Must be >= 1. (Default: 120)")
+    private int storage_init_timeout_seconds = 120;
+
+    @EnvName("STORAGE_INIT_PARALLELISM")
+    @ConfigYamlOnly
+    @JsonProperty
+    @ConfigDescription(
+            "How many tenant storages (connection pools) the core initialises at the same time at startup. A higher "
+                    + "value starts many tenant databases faster, a lower one sends fewer connections at once to a "
+                    + "database many tenants share. Each storage still initialising after "
+                    + "storage_init_timeout_seconds lets one more storage start, so while such storages are still "
+                    + "running, more than this many can be initialising. Must be >= 1. (Default: 16)")
+    private int storage_init_parallelism = 16;
 
     @EnvName("PASSWORD_RESET_TOKEN_LIFETIME")
     @IgnoreForAnnotationCheck
@@ -195,6 +257,88 @@ public class CoreConfig {
     @JsonProperty
     @ConfigDescription("Sets the max thread pool size for incoming http server requests. (Default: 10)")
     private int max_server_pool_size = 10;
+
+    @EnvName("MAX_CONCURRENT_REQUESTS_PER_CUD")
+    @NotConflictingInConnectionUriDomain
+    @JsonProperty
+    @ConfigDescription(
+            "Maximum number of requests from one connection URI domain that may be in flight at the "
+                    + "same time. Only requests that pass the API-key check for an app that exists under the "
+                    + "domain count toward it; requests to routes without an API-key check (e.g. /hello, "
+                    + "/livez, /.well-known/jwks.json) and requests naming an app that does not exist only add "
+                    + "to the pool's saturation and are never capped. Requests on the admin port (admin_port) "
+                    + "bypass both the cap and the saturation count. This is a fair-share rule, enforced only "
+                    + "while the request pool is saturated (see concurrency_cap_reserved_pool_percent): a "
+                    + "connection URI domain over its cap then gets HTTP 429 immediately instead of a thread; "
+                    + "below that, no request is ever rejected. Must be the same for all apps/tenants under a "
+                    + "connection URI domain and cannot exceed max_server_pool_size. 0 disables the cap. "
+                    + "(Default: 0)")
+    private int max_concurrent_requests_per_cud = 0;
+
+    @EnvName("CONCURRENCY_CAP_RESERVED_POOL_PERCENT")
+    @ConfigYamlOnly
+    @JsonProperty
+    @ConfigDescription(
+            "Share of max_server_pool_size (percent) kept free for connection URI domains under their "
+                    + "max_concurrent_requests_per_cud. The per-tenant cap is only enforced once the pool has fewer "
+                    + "free threads than this; below that, tenants may exceed their cap. 100 keeps no headroom, so the "
+                    + "cap is always enforced (a hard cap). Must be between 1 and 100. (Default: 25)")
+    private int concurrency_cap_reserved_pool_percent = 25;
+
+    @EnvName("USERS_COUNT_MAX_AGE_MS")
+    @ConfigYamlOnly
+    @JsonProperty
+    @ConfigDescription(
+            "How old, in milliseconds, a full user count may be before it is counted again. Telemetry's user " +
+                    "count, the license-usage stats and the unfiltered tenant count of /users/count on CDI 5.7 (or " +
+                    "5.6 with allowApproximate) are the last full count plus the sign-ups, deletions and links " +
+                    "logged since; the full count is shared by every core through the database and redone once it " +
+                    "is older than this, so a lower value means fresher counts but more full counts on the " +
+                    "database. While a burst (e.g. a bulk import) is being rolled into the count, /users/count gets the " +
+                    "count as of before it, with an older asOf. Other /users/count calls are exact counts and are " +
+                    "not affected. Only read from the " +
+                    "base config. (Default: 600000)")
+    private long users_count_max_age_ms = 600000;
+
+    @EnvName("SUPERTOKENS_ADMIN_PORT")
+    @ConfigYamlOnly
+    @JsonProperty
+    @ConfigDescription(
+            "The port for a second webserver connector that serves liveness and control-plane routes from a thread " +
+                    "pool separate from the data-plane pool. When set to null, the admin connector is disabled and " +
+                    "all routes are served on the main port exactly as before. The admin port is NOT a separate " +
+                    "trust boundary: it applies the same 'api_keys' and IP-allow rules as the main port, binds the " +
+                    "same 'host', and has no credential of its own. It carries sensitive routes (e.g. '/ee/license', " +
+                    "which sets the license key, and '/global-request-stats'), so it is meant for the orchestrator / " +
+                    "control plane and should not be exposed beyond the network boundary your liveness check and " +
+                    "control plane already live in. (Default: null)")
+    private Integer admin_port = null;
+
+    @EnvName("ADMIN_MAX_SERVER_POOL_SIZE")
+    @ConfigYamlOnly
+    @JsonProperty
+    @ConfigDescription(
+            "Sets the max thread pool size for requests to the admin connector. Only used when admin_port is set. " +
+                    "(Default: 5)")
+    private int admin_max_server_pool_size = 5;
+
+    @EnvName("ADMIN_ONLY_PATHS")
+    @ConfigYamlOnly
+    @JsonProperty
+    @ConfigDescription(
+            "Comma-separated list of API paths to serve only on the admin port, overriding their compiled-in route " +
+                    "scope (e.g. '/ee/license'). Each entry must match a known API path, and admin_port must be set. " +
+                    "(Default: null)")
+    private String admin_only_paths = null;
+
+    @EnvName("ADMIN_PREFERRED_PATHS")
+    @ConfigYamlOnly
+    @JsonProperty
+    @ConfigDescription(
+            "Comma-separated list of API paths to serve on both the admin and main ports, overriding their " +
+                    "compiled-in route scope. Each entry must match a known API path, and admin_port must be set. " +
+                    "(Default: null)")
+    private String admin_preferred_paths = null;
 
     @EnvName("API_KEYS")
     @NotConflictingInApp
@@ -370,6 +514,16 @@ public class CoreConfig {
                     "null)")
     private String supertokens_max_cdi_version = null;
 
+    @EnvName("SUPERTOKENS_MIN_CDI_VERSION")
+    @NotConflictingInApp
+    @JsonProperty
+    @HideFromDashboard
+    @ConfigDescription(
+            "The minimum CDI version that the core will accept. Requests using a CDI version lower than this are " +
+                    "rejected with a 400. When set to null, all CDI versions supported by the core are accepted. " +
+                    "(Default: null)")
+    private String supertokens_min_cdi_version = null;
+
     @EnvName("SUPERTOKENS_SAAS_LOAD_ONLY_CUD")
     @ConfigYamlOnly
     @JsonProperty
@@ -421,7 +575,36 @@ public class CoreConfig {
     @JsonProperty
     @ConfigDescription("If specified, the supertokens core will load the specified number of users for migrating in " +
             "one single batch. (Default: 8000)")
-    private int bulk_migration_batch_size =  8000;
+    private int bulk_migration_batch_size = 8000;
+
+    @EnvName("BULK_MIGRATION_SLEEP_BETWEEN_ROUNDS_IN_BATCH_MS")
+    @NotConflictingInApp
+    @JsonProperty
+    @ConfigDescription(
+            "If specified, the bulk migration will wait between rounds. To disable it, set it to null. (Default: 1000)")
+    private Integer bulk_migration_sleep_between_rounds_in_batch_ms = 1000;
+
+    @EnvName("ACTIVITY_LOG_RETENTION_DAYS")
+    @NotConflictingInConnectionUriDomain
+    @JsonProperty
+    @HideFromDashboard
+    @ConfigDescription(
+            "Number of days of activity_log entries to retain; older entries are dropped by a periodic cleanup. Must " +
+                    "be the same for all apps/tenants under a connection URI domain. (Default: 31)")
+    private int activity_log_retention_days = 31;
+
+    @EnvName("ACTIVITY_LOG_THROTTLE_ENABLED")
+    @NotConflictingInConnectionUriDomain
+    @JsonProperty
+    @HideFromDashboard
+    @ConfigDescription(
+            "If true, throttled activity events (token_refresh, oauth_token_exchange, oauth_authorize) are " +
+                    "collapsed to at most one activity_log write per (app, user) every 5 minutes, so a burst of " +
+                    "refreshes does not turn into a per-request insert. sign_in, session_create and sign_out are " +
+                    "never throttled. Set to false to record every activity event as its own row (a complete " +
+                    "audit trail) at the cost of that write volume. Must be the same for all apps/tenants under a " +
+                    "connection URI domain. (Default: true)")
+    private boolean activity_log_throttle_enabled = true;
 
     @EnvName("WEBAUTHN_RECOVER_ACCOUNT_TOKEN_LIFETIME")
     @NotConflictingInApp
@@ -610,6 +793,34 @@ public class CoreConfig {
         return (long) (refresh_token_validity * 60 * 1000);
     }
 
+    public int getRefreshTokenRotationGracePeriodInSeconds() {
+        return refresh_token_rotation_grace_period;
+    }
+
+    public long getRefreshTokenRotationGracePeriodInMillis() {
+        return refresh_token_rotation_grace_period * 1000L;
+    }
+
+    public double getAccessTokenValidityJitter() {
+        return access_token_validity_jitter;
+    }
+
+    public String getRecentTokenReuseBehaviour() {
+        return recent_token_reuse_behaviour;
+    }
+
+    public boolean getSchemaCheckStrictMode() {
+        return schema_check_strict_mode;
+    }
+
+    public int getStorageInitTimeoutSeconds() {
+        return storage_init_timeout_seconds;
+    }
+
+    public int getStorageInitParallelism() {
+        return storage_init_parallelism;
+    }
+
     public long getPasswordResetTokenLifetime() {
         return password_reset_token_lifetime;
     }
@@ -676,8 +887,86 @@ public class CoreConfig {
         return host;
     }
 
+    public long getUsersCountMaxAgeMs() {
+        return users_count_max_age_ms;
+    }
+
     public int getMaxThreadPoolSize() {
         return max_server_pool_size;
+    }
+
+    public int getMaxConcurrentRequestsPerCud() {
+        return max_concurrent_requests_per_cud;
+    }
+
+    // The process-wide in-flight request count at or above which the per-CUD concurrency cap starts being
+    // enforced. Derived from the base pool size and the reserved-headroom percent so that some threads always
+    // stay available for connection URI domains under their cap. 100% reserved => threshold 0 => the cap is
+    // always enforced. This reads the base config's pool size (max_server_pool_size is @ConfigYamlOnly).
+    public int getConcurrencyCapSaturationThreshold() {
+        int reserved = (int) Math.floor((double) max_server_pool_size * concurrency_cap_reserved_pool_percent / 100.0);
+        // A nonzero reserve percent that rounds down to zero (small pool and/or small percent) must still reserve at
+        // least one slot, otherwise the threshold would equal the pool size. Since global in-flight is bounded by
+        // maxThreads (== max_server_pool_size), "global > threshold" could then never hold and the cap would be
+        // silently never enforced despite the operator asking for a reserve.
+        if (concurrency_cap_reserved_pool_percent > 0 && reserved == 0) {
+            reserved = 1;
+        }
+        return max_server_pool_size - reserved;
+    }
+
+    public boolean isAdminConnectorEnabled() {
+        return admin_port != null;
+    }
+
+    public int getAdminPort() {
+        return admin_port;
+    }
+
+    public int getAdminMaxThreadPoolSize() {
+        return admin_max_server_pool_size;
+    }
+
+    // Route-scope overrides: operator-configured, per-path overrides of the compiled-in RouteScope, layered on top
+    // of the defaults (a path not listed keeps whatever scope its API declares). Only consulted when the admin
+    // connector is enabled; normalizeAndValidate rejects overrides when admin_port is unset.
+    public Set<String> getAdminOnlyPaths() {
+        return parsePathList(admin_only_paths);
+    }
+
+    public Set<String> getAdminPreferredPaths() {
+        return parsePathList(admin_preferred_paths);
+    }
+
+    private static Set<String> parsePathList(String csv) {
+        Set<String> paths = new HashSet<>();
+        if (csv == null) {
+            return paths;
+        }
+        for (String raw : csv.split(",")) {
+            String p = normalizeApiPath(raw);
+            if (!p.isEmpty()) {
+                paths.add(p);
+            }
+        }
+        return paths;
+    }
+
+    // Normalize an API path for route-scope override matching: trim, lowercase, ensure a single leading slash, and
+    // drop a trailing slash. PathRouter derives the override key from a matched API's getPath() through this same
+    // method, so the two representations stay in lockstep.
+    public static String normalizeApiPath(String path) {
+        String p = path.trim().toLowerCase();
+        if (p.isEmpty()) {
+            return p;
+        }
+        if (!p.startsWith("/")) {
+            p = "/" + p;
+        }
+        if (p.length() > 1 && p.endsWith("/")) {
+            p = p.substring(0, p.length() - 1);
+        }
+        return p;
     }
 
     public boolean getHttpsEnabled() {
@@ -694,6 +983,18 @@ public class CoreConfig {
 
     public int getBulkMigrationBatchSize() {
         return bulk_migration_batch_size;
+    }
+
+    public Integer getBulkMigrationSleepBetweenRoundsInBatchMs() {
+        return bulk_migration_sleep_between_rounds_in_batch_ms;
+    }
+
+    public int getActivityLogRetentionDays() {
+        return activity_log_retention_days;
+    }
+
+    public boolean getActivityLogThrottleEnabled() {
+        return activity_log_throttle_enabled;
     }
 
     public String getOtelCollectorConnectionURI() {
@@ -751,15 +1052,19 @@ public class CoreConfig {
 
                 if (field.getType().equals(String.class)) {
                     configJson.addProperty(field.getName(), stringValue);
-                } else if (field.getType().equals(int.class)) {
+                } else if (field.getType().equals(int.class) || field.getType().equals(Integer.class)) {
+                    // Integer (boxed) is used for fields that need a null = unset sentinel, e.g. admin_port and
+                    // bulk_migration_sleep_between_rounds_in_batch_ms. Without this branch their env vars
+                    // (SUPERTOKENS_ADMIN_PORT etc.) are read but never written to configJson, so the value is
+                    // silently dropped and the field stays at its default/null.
                     configJson.addProperty(field.getName(), Integer.parseInt(stringValue));
-                } else if (field.getType().equals(long.class)) {
+                } else if (field.getType().equals(long.class) || field.getType().equals(Long.class)) {
                     configJson.addProperty(field.getName(), Long.parseLong(stringValue));
-                } else if (field.getType().equals(boolean.class)) {
+                } else if (field.getType().equals(boolean.class) || field.getType().equals(Boolean.class)) {
                     configJson.addProperty(field.getName(), Boolean.parseBoolean(stringValue));
-                } else if (field.getType().equals(float.class)) {
+                } else if (field.getType().equals(float.class) || field.getType().equals(Float.class)) {
                     configJson.addProperty(field.getName(), Float.parseFloat(stringValue));
-                } else if (field.getType().equals(double.class)) {
+                } else if (field.getType().equals(double.class) || field.getType().equals(Double.class)) {
                     configJson.addProperty(field.getName(), Double.parseDouble(stringValue));
                 }
             }
@@ -805,6 +1110,22 @@ public class CoreConfig {
             }
         }
 
+        if (!Main.isTesting || validityTesting) { // testing may set windows outside the normal bounds
+            if (refresh_token_rotation_grace_period < 0 || refresh_token_rotation_grace_period > 300) {
+                throw new InvalidConfigException(
+                        "'refresh_token_rotation_grace_period' must be between 0 and 300 seconds inclusive." +
+                                (includeConfigFilePath ? " The config file can be"
+                                        + " found here: " + getConfigFileLocation(main) : ""));
+            }
+        }
+
+        if (access_token_validity_jitter < 0 || access_token_validity_jitter > 0.25) {
+            throw new InvalidConfigException(
+                    "'access_token_validity_jitter' must be between 0 and 0.25 inclusive." +
+                            (includeConfigFilePath ? " The config file can be"
+                                    + " found here: " + getConfigFileLocation(main) : ""));
+        }
+
         if (password_reset_token_lifetime <= 0) {
             throw new InvalidConfigException("'password_reset_token_lifetime' must be >= 0");
         }
@@ -829,11 +1150,65 @@ public class CoreConfig {
             throw new InvalidConfigException("'totp_rate_limit_cooldown_sec' must be > 0");
         }
 
+        if (users_count_max_age_ms <= 0) {
+            throw new InvalidConfigException("'users_count_max_age_ms' must be > 0");
+        }
+
         if (max_server_pool_size <= 0) {
             throw new InvalidConfigException(
                     "'max_server_pool_size' must be >= 1." +
                             (includeConfigFilePath ? " The config file can be"
                                     + " found here: " + getConfigFileLocation(main) : ""));
+        }
+
+        if (max_concurrent_requests_per_cud < 0) {
+            throw new InvalidConfigException("'max_concurrent_requests_per_cud' must be >= 0");
+        }
+
+        if (max_concurrent_requests_per_cud > max_server_pool_size) {
+            throw new InvalidConfigException(
+                    "'max_concurrent_requests_per_cud' must be <= 'max_server_pool_size'");
+        }
+
+        if (concurrency_cap_reserved_pool_percent < 1 || concurrency_cap_reserved_pool_percent > 100) {
+            throw new InvalidConfigException(
+                    "'concurrency_cap_reserved_pool_percent' must be between 1 and 100 inclusive");
+        }
+
+        if (admin_port != null) {
+            // Require a concrete, reachable port. admin_port == 0 would tell Tomcat to bind an ephemeral port, but
+            // getAdminPort() still returns 0, so the PathRouter gate (req.getLocalPort() == adminPort) could never
+            // match — ADMIN_ONLY routes would be unreachable and DATA_PLANE routes would leak onto the random admin
+            // port. The connector is meant to be reached at a known port, so reject 0.
+            if (admin_port < 1 || admin_port > 65535) {
+                throw new InvalidConfigException("'admin_port' must be between 1 and 65535 inclusive.");
+            }
+            // Compare against the effective port: the CLI port override is only applied further down.
+            Integer cliPortOverride = CLIOptions.get(main).getPort();
+            int effectivePort = cliPortOverride != null ? cliPortOverride : port;
+            if (admin_port == effectivePort) {
+                throw new InvalidConfigException("'admin_port' must be different from 'port'.");
+            }
+            if (admin_max_server_pool_size <= 0) {
+                throw new InvalidConfigException("'admin_max_server_pool_size' must be >= 1.");
+            }
+        }
+
+        // Route-scope overrides only make sense when the admin connector is enabled (they map routes onto the admin
+        // port). A path can't be forced to two scopes at once. The "path must match a known API" check needs the
+        // registered API list, which only exists once the webserver is wired up, so it lives in
+        // PathRouter.validateRouteScopeOverrides() and fails startup there.
+        Set<String> adminOnlyPaths = getAdminOnlyPaths();
+        Set<String> adminPreferredPaths = getAdminPreferredPaths();
+        if ((!adminOnlyPaths.isEmpty() || !adminPreferredPaths.isEmpty()) && admin_port == null) {
+            throw new InvalidConfigException(
+                    "'admin_only_paths' and 'admin_preferred_paths' require 'admin_port' to be set.");
+        }
+        for (String p : adminOnlyPaths) {
+            if (adminPreferredPaths.contains(p)) {
+                throw new InvalidConfigException(
+                        "'" + p + "' cannot be listed in both 'admin_only_paths' and 'admin_preferred_paths'.");
+            }
         }
 
         if (api_keys != null) {
@@ -953,12 +1328,44 @@ public class CoreConfig {
             }
         }
 
+        if (supertokens_min_cdi_version != null) {
+            SemVer minVersion;
+            try {
+                minVersion = new SemVer(supertokens_min_cdi_version);
+            } catch (IllegalArgumentException e) {
+                throw new InvalidConfigException("supertokens_min_cdi_version is not a valid semantic version");
+            }
+            if (!WebserverAPI.supportedVersions.contains(minVersion)) {
+                throw new InvalidConfigException("supertokens_min_cdi_version is not a supported version");
+            }
+            if (supertokens_max_cdi_version != null
+                    && minVersion.greaterThan(new SemVer(supertokens_max_cdi_version))) {
+                throw new InvalidConfigException(
+                        "supertokens_min_cdi_version cannot be greater than supertokens_max_cdi_version");
+            }
+        }
+
+        if (storage_init_timeout_seconds < 1) {
+            throw new InvalidConfigException("Provided storage_init_timeout_seconds must be >= 1");
+        }
+
+        if (storage_init_parallelism < 1) {
+            throw new InvalidConfigException("Provided storage_init_parallelism must be >= 1");
+        }
+
         if (bulk_migration_parallelism < 1) {
             throw new InvalidConfigException("Provided bulk_migration_parallelism must be >= 1");
         }
 
         if (bulk_migration_batch_size < 1) {
             throw new InvalidConfigException("Provided bulk_migration_batch_size must be >= 1");
+        }
+
+        // Retention must comfortably exceed the 10-minute (600s) last-active rollup interval so every
+        // activity_log row is folded before its partition is dropped; the smallest allowed value (1 day)
+        // already clears that horizon by two orders of magnitude.
+        if (activity_log_retention_days < 1) {
+            throw new InvalidConfigException("Provided activity_log_retention_days must be >= 1");
         }
 
         if (webauthn_recover_account_token_lifetime <= 0) {
@@ -988,6 +1395,9 @@ public class CoreConfig {
         }
 
         // Normalize
+        // This default is shared by every deployment, so the audience alone cannot tell two SuperTokens SPs
+        // apart. SAML compensates by requiring an ACS allow-list for IdP-initiated login and a matching signed
+        // Recipient on the authenticating assertion. See GHSA-wfg2-vqfg-rqh6.
         if (saml_sp_entity_id == null) {
             saml_sp_entity_id = "https://saml.supertokens.com";
         }
@@ -1007,6 +1417,10 @@ public class CoreConfig {
 
         if (log_level != null) {
             log_level = log_level.trim().toUpperCase();
+        }
+
+        if (recent_token_reuse_behaviour != null) {
+            recent_token_reuse_behaviour = recent_token_reuse_behaviour.trim().toUpperCase();
         }
 
         { // info_log_path
@@ -1130,14 +1544,15 @@ public class CoreConfig {
         }
 
         if (Main.isTesting) {
+            String oauthHost = System.getProperty("ST_OAUTH_PROVIDER_SERVICE_HOST", "localhost");
             if (oauth_provider_public_service_url == null) {
-                oauth_provider_public_service_url = "http://localhost:" + System.getProperty("ST_OAUTH_PROVIDER_SERVICE_PORT");
+                oauth_provider_public_service_url = "http://" + oauthHost + ":" + System.getProperty("ST_OAUTH_PROVIDER_SERVICE_PORT");
             }
             if (oauth_provider_admin_service_url == null) {
-                oauth_provider_admin_service_url = "http://localhost:" + System.getProperty("ST_OAUTH_PROVIDER_ADMIN_PORT");
+                oauth_provider_admin_service_url = "http://" + oauthHost + ":" + System.getProperty("ST_OAUTH_PROVIDER_ADMIN_PORT");
             }
             if (oauth_provider_url_configured_in_oauth_provider == null) {
-                oauth_provider_url_configured_in_oauth_provider = "http://localhost:4444";
+                oauth_provider_url_configured_in_oauth_provider = "http://" + oauthHost + ":4444";
             }
             if (oauth_client_secret_encryption_key == null) {
                 oauth_client_secret_encryption_key = "clientsecretencryptionkey";
@@ -1225,9 +1640,11 @@ public class CoreConfig {
 
                 if (fieldType == String.class) {
                     valueType = "string";
-                } else if (fieldType == boolean.class) {
+                } else if (fieldType == boolean.class || fieldType == Boolean.class) {
                     valueType = "boolean";
-                } else if (fieldType == int.class || fieldType == long.class || fieldType == double.class) {
+                } else if (fieldType == int.class || fieldType == Integer.class
+                        || fieldType == long.class || fieldType == Long.class
+                        || fieldType == double.class || fieldType == Double.class) {
                     valueType = "number";
                 } else {
                     throw new RuntimeException("Unknown field type " + fieldType.getName());
@@ -1274,8 +1691,30 @@ public class CoreConfig {
         }
     }
 
+    void assertThatConfigFromSameConnectionUriDomainAreNotConflicting(CoreConfig other)
+            throws InvalidConfigException {
+        // we do not allow different values for this across any app/tenant in the same connection URI domain
+        for (Field field : CoreConfig.class.getDeclaredFields()) {
+            if (field.isAnnotationPresent(NotConflictingInConnectionUriDomain.class)) {
+                try {
+                    if (!Objects.equals(field.get(this), field.get(other))) {
+                        throw new InvalidConfigException(
+                                "You cannot set different values for " + field.getName() +
+                                        " for the same connectionUriDomain");
+                    }
+                } catch (IllegalAccessException e) {
+                    throw new RuntimeException(e);
+                }
+            }
+        }
+    }
+
     public String getMaxCDIVersion() {
         return this.supertokens_max_cdi_version;
+    }
+
+    public String getMinCDIVersion() {
+        return this.supertokens_min_cdi_version;
     }
 
     private boolean isAnySet(List<String> configs){

@@ -5,7 +5,376 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [12.4.1]
+
+- Fixes database CPU spikes at startup: telemetry and license-usage user counts are no longer counted by every core; one count is stored in the database and shared by all cores for up to `users_count_max_age_ms`.
+- `/users/count` on CDI 5.7 (or 5.6 with `allowApproximate`) uses the same shared count for the unfiltered tenant count.
+- Telemetry's `usersCount` is the app-wide user count for every app.
+- A failed telemetry ping or license sync is retried within minutes instead of the next day.
+- The startup telemetry ping is delayed by 60-120s.
+- New config: `users_count_max_age_ms`.
+
+## [12.4.0]
+
+- Requires plugin interface 11.0.
+- Hardening: the legacy SAML userinfo endpoint now rejects a malformed bearer token with a 400 instead of throwing on a token like `x.` (previously an unauthenticated 500), and parses the `<code>.<clientId>` token on the first dot only so a caller-supplied `clientId` that contains dots is preserved rather than truncated.
+- Hardening: the embedded Tomcat error valve no longer discloses the server build string or exception stack frames on connector-level errors.
+- Fixes a startup hang when many tenant storages initialise at once on JDK 21: storage initialisation now runs on a bounded pool of platform threads (16 storages at a time by default, set by `storage_init_parallelism`) instead of virtual threads, which could be pinned inside the storage plugin's `synchronized` pool setup until no carrier was left to release the shared logging locks.
+- Startup no longer waits indefinitely for a storage to initialise: storages still initialising are logged every 60s, a storage that has been initialising for longer than `storage_init_timeout_seconds` (new, default 120, counted from when its own initialisation started) is reported as an error, and boot continues without such stragglers once every other storage has finished (they keep initialising in the background). Signing keys of the apps on such a storage are loaded on first use instead of during startup, so startup does not wait for it later either; requests for those apps wait until it is ready. Boot never continues past a storage whose initialisation has not started yet, and each reported straggler makes room for a queued storage, so wedged storages cannot keep the others from starting. `storage_init_parallelism` (new, default 16) sets how many storages start initialising at once; each reported straggler lets one more start, so more can be initialising while stragglers are still running. The base tenant's storage is initialised first, on the boot thread and with no time limit, and is never left behind. A storage whose initialisation fails with an unexpected error still fails startup even while another storage is still initialising.
+- Adds an opt-in admin webserver connector on a separate port (`admin_port`) with its own thread pool (`admin_max_server_pool_size`, default 5), and a port-scoped route classification (`RouteScope`: `DATA_PLANE`/`ADMIN_ONLY`/`ADMIN_PREFERRED`) so liveness/control-plane traffic can be served isolated from the data-plane pool; `/hello` and `/ee/*` are `ADMIN_PREFERRED` (served on both ports). When `admin_port` is unset, the server runs a single connector exactly as before.
+- Fixes boxed-`Integer` config fields being silently dropped when set via environment variable: `updateConfigJsonFromEnv` had no `Integer` branch, so `SUPERTOKENS_ADMIN_PORT` (and the pre-existing `BULK_MIGRATION_SLEEP_BETWEEN_ROUNDS_IN_BATCH_MS`) were read but never applied.
+- Adds optional per-path route-scope overrides for the admin connector: `admin_only_paths` and `admin_preferred_paths` (comma-separated API paths, yaml/env) layer over the compiled-in `RouteScope` defaults, so an operator can promote a route to `ADMIN_ONLY` or widen one to `ADMIN_PREFERRED` without a code change. Both require `admin_port`, reject overlaps, and fail startup on a path that matches no known API.
+- Adds an admin-only `GET /global-request-stats` endpoint returning process-global, in-memory request counts bucketed by response-status class (`2xx`/`4xx`/`5xx`), a `total`, and a `since` timestamp (cumulative since process start, never persisted). The counts span every connection URI domain and app, so an app's own api key does not unlock them: the endpoint requires `supertokens_saas_secret` when it is set, otherwise one of the base config's `api_keys`. Requests answered early (a `429` from the concurrency cap, an IP-filter denial) are counted too. Additive: the per-app `GET /requests/stats` is unchanged.
+- Adds a DB-free `/livez` liveness endpoint (`ADMIN_ONLY`, no api-key, no cdi-version) for the container health check: it does no storage access and takes no shared lock, so it stays responsive on the admin connector's isolated pool under data-plane thread saturation and DB-pool exhaustion (unlike `/hello`, which does a storage round-trip and is a readiness check).
+- Fixes an app losing its `FeatureFlag` resource (and `/ee/license` then failing with tenant-not-found) when reloading it throws; the app now keeps its previous resource and the failure is logged with a stack trace. Also fixes `Logging.error` silently swallowing exceptions with a null message.
+- When `supertokens_saas_load_only_cud` excludes a connectionUriDomain that was previously loaded — wiping its resources and otherwise surfacing only as a log-free tenant-not-found on every request for that CUD — the drop is now logged at error level, pointing at the config vs. stored-CUD mismatch.
+- The EE license-key sync no longer runs synchronously in the `FeatureFlag` constructor (on the boot thread and under the resource-distributor lock on every tenant/app reload); it now runs on the `EELicenseCheck` cron with a short jittered initial delay after startup, then daily as before. Enabled features are served from the last persisted sync in the meantime, so feature gating is unchanged (an app that has not synced yet reads as no EE features — exactly what a key-less sync persists — and `PUT /ee/license` still syncs inline); the only behavioural change is that an app created or updated at runtime first reports its paid-usage stats on the next cron pass rather than immediately.
+- Adds `max_concurrent_requests_per_cud` (SaaS-protected, `0` = off) and `concurrency_cap_reserved_pool_percent` (base config, default 25): once the request pool has less than the reserved share of free threads, a connection URI domain above its cap gets `429` immediately instead of a thread; below that, no request is ever rejected. Only requests that pass the API-key check for an existing app are charged to a connection URI domain's cap; requests to routes without an API-key check (e.g. `/hello`, `/livez`, `/.well-known/jwks.json`) and requests naming an app that does not exist only count toward saturation and are never capped, so unauthenticated traffic cannot use up another domain's cap. Requests on the admin connector skip the cap entirely and do not count toward saturation.
+- `GET /requests/stats` now also reports `concurrentRequestsRejected` (requests 429'd by the concurrency cap since process start) and `concurrentRequestsInFlight` (requests charged to the domain's cap that are in flight); a rejection is logged at most once per connection URI domain per minute. `concurrentRequestsInFlight` is CUD-wide (the cap is per connection URI domain), so every app in the same CUD reports the same value — scrapers should aggregate it per-CUD, not sum it across an app list.
+- Fix: WebAuthN.updateUserEmail resolved the user-id mapping on a second pooled connection; the lookup now runs on the transaction's own connection.
+- Fixes a slow WebAuthn sign-in lookup that read every credential of the app. Sign-in now finds the credential
+  by its relying party too, so a credential registered for another relying party returns
+  `CREDENTIAL_NOT_FOUND_ERROR` instead of `INVALID_AUTHENTICATOR_ERROR`.
+- In-memory storage: WebAuthn sign-up and sign-in only accept generated options from the request's tenant,
+  matching PostgreSQL.
+- A core config value that is a JSON object or array (for example `"access_token_validity": {}` in a create/update app or tenant request, or a map in `config.yaml`) is now rejected as an invalid config (HTTP 400) instead of failing with an `UnsupportedOperationException` (HTTP 500).
+- Container security scan: pin `org.bouncycastle:bcprov-jdk18on` to 1.85 (CVE-2026-8763), and pull the base image on every container build so OS security patches land in each release/dev image.
+- Environment variables are now also applied to boxed `Long`, `Boolean`, `Float` and `Double` config fields, not only to primitives and boxed `Integer`.
+- Fix: WebAuthN.signIn resolved the user-id mapping on a second pooled connection; the lookup now runs on the transaction's own connection.
+- Session verify on CDI < 5.6 (when it updates the session), OAuth non-rotating refresh and the in-memory passwordless device creation now run at the default READ COMMITTED isolation level instead of REPEATABLE READ. The first two already lock the session / token row with `SELECT ... FOR UPDATE`, so a concurrent request now waits and reads the latest row instead of failing with a serialization error and retrying.
+- Adds a test-only connection-pool guard (in-memory + postgresql): a call chain that holds one connection and borrows a second from the same pool — the nested-acquisition pool-exhaustion pattern — is detected in tests. Warns by default while the existing instances are cleaned up; an opt-in flag makes it fail fast.
+- The nested same-pool connection-acquisition guard now fails fast by default.
+- A session create now writes one activity-log row instead of two: an unthrottled `session_create` with the session handle and SuperTokens user ids; the untyped `session_created` event is no longer written. Anyone querying `activity_log` directly (for example SIEM exports or audit queries) should note the rename: rows previously written as `session_created` are now `session_create`.
+- Fix: `EmailPassword.consumeResetPasswordToken` no longer borrows a second pooled connection inside its transaction (new `AuthRecipe.getUserById_Transaction` and `listPrimaryUsersByEmail/PhoneNumber_Transaction` reads).
+- Fixes role revocation returning UNKNOWN_ROLE_ERROR for tenants with their own storage: role existence is now checked against the app-level storage before the tenant transaction, mirroring how role assignment works
+- Adds test-only, per-request transaction and commit counters to the in-memory storage (transactions opened, writing commits, auto-commit writes), and a baseline test that pins today's counts for the hot session, sign-up / sign-in and read APIs. No production behaviour change.
+- User id mapping lookups (`UserIdMapping.getUserIdMapping`) are now plain autocommit reads instead of a transaction around a single read, so get user by id, user metadata get, session create and refresh each open one transaction fewer. In-memory storage: the WebAuthn part of a user lookup no longer opens a transaction, matching PostgreSQL.
+- Non-rotating OAuth refresh no longer holds multiple DB connections per request: the token-revocation read now runs on the request's existing transaction connection, and token re-signing serves the pre-warmed signing-key caches instead of opening a nested transaction — removing the hold-and-wait pool exhaustion under load.
+- Adds a regression test asserting a non-rotating OAuth refresh borrows at most one DB connection at a time.
+- Non-rotating OAuth refresh: revoking a locally revoked token at the provider now checks the client on the request's transaction connection, and verifying the re-signed access token reads the signing keys from cache only, so neither borrows a second DB connection.
+
+## [12.3.1]
+
+### Security
+
+- SAML callback replay hardening (GHSA-3r7x-rhvc-fw28): the callback RelayState is now single-use, every assertion is consumed at most once (new `saml_consumed_assertions` table), and the response is bound to the login via InResponseTo and Destination/Recipient pinning — closing the SP- and IdP-initiated replay windows.
+- SAML: a client can carry an optional ACS-URL allow-list (`acsURLs`). When set, the login's ACS URL (SP-initiated) and the response Destination/`SubjectConfirmationData.Recipient` (IdP-initiated) must be a member — extending Destination/Recipient pinning to the IdP-initiated path, which previously had no anchor. The list is required when IdP-initiated login is enabled: it is checked on every client create/update, and IdP-initiated logins for an existing client without one are refused until it is set. (GHSA-3r7x-rhvc-fw28 follow-up)
+- SAML: identity and audience are taken from a single validated assertion, which must also carry a signed `Recipient` matching the ACS URL, so an assertion issued to a different Service Provider can no longer supply the authenticated identity. `saml_sp_entity_id` keeps its default `https://saml.supertokens.com` (GHSA-wfg2-vqfg-rqh6).
+- Multitenancy: an app-scoped API key can no longer rewrite its parent connectionUriDomain's credentials to take over sibling apps (GHSA-4rf2-xqvf-8rcx).
+- WebAuthn: sign-in is scoped to the requested tenant, so a passkey registered in one tenant is no longer accepted at another (GHSA-6v34-w48w-44rc).
+- Sessions: session creation is serialized with account unlink under the same per-user lock, so a session created concurrently with unlink can no longer survive its revocation (GHSA-2pc4-vw9j-454c).
+
+### Migration
+
+The SAML replay hardening adds two columns to `saml_relay_state` and the `saml_consumed_assertions` table. The core applies them at startup (`CREATE TABLE` / `ADD COLUMN IF NOT EXISTS`), so an in-place upgrade needs no manual step; large PostgreSQL deployments can pre-apply `migration-scripts/v9.9.1.sql` (supertokens-postgresql-plugin 9.9.1). Additive and online-safe.
+
+## [12.3.0]
+
+- Adds an `activity_log` lifecycle/activity event ledger: user creation, import, deletion, account (un)linking, tenant (dis)association and semantic activity events (`sign_in`, `token_refresh`, `session_create`, `sign_out`, `oauth_token_exchange`, `oauth_authorize`) are written atomically with their mutation, enforced by a compile-time AspectJ audit guard on raw `startTransaction`. New protected configs `activity_log_retention_days` (default 31) and `activity_log_throttle_enabled` (default `true`).
+- `GET /users/count` serves an exact `anchor + fold` of the ledger instead of recomputing per request. From CDI 5.7 this is the default single-tenant behaviour (carrying `approximate`/`asOf`); CDI 5.6 keeps its released contract where the ledger value is opt-in via `allowApproximate=true`; older CDI is unchanged.
+- `user_last_active` is now derived by the new `RollupUserLastActive` cron folding activity events (its sole writer); `ActiveUsers.updateLastActive` only appends throttled events, so MAU counts reflect activity within a rollup interval.
+- Active-user activity and its projection now live on the user's own storage (not the app-public tenant), and active-user counts (`GET /users/count/active`, telemetry MAU) sum across every storage backing the app, so a user on a tenant with its own database is counted correctly.
+- In-memory (SQLite) parity for the ledger and rollup storage contract (transactional audit insert, last-active fold/reconcile, windowed event read, and the connection-taking sign-up/tenant-removal variants).
+
+### Migration
+
+The `activity_log.payload` column changes from `TEXT` to `JSONB` (structured lifecycle-event payloads). Applied automatically at startup by the core (guarded and idempotent — skipped when the column is already `JSONB`), so an in-place upgrade needs no manual step. The canonical SQL is in supertokens-postgresql-plugin `migration-scripts/v9.9.0.sql`.
+
+**Large-deployment note:** this is an `ALTER COLUMN ... TYPE JSONB` on the partitioned `activity_log` parent, which rewrites every partition under an `ACCESS EXCLUSIVE` lock. On a large `activity_log` run the migration script *before* upgrading to avoid a startup stall (all historical payloads are `NULL`, so the cast is a pure type rewrite).
+
+```sql
+ALTER TABLE activity_log ALTER COLUMN payload TYPE JSONB USING payload::jsonb;
+```
+
+## [12.2.0]
+
+- **Upgrade note: the core now verifies the database schema at startup and, with `schema_check_strict_mode: true` (default), refuses to start until the manual migrations from the CHANGELOGs are applied**
+- Verifies the database schema at startup: missing tables/columns are reported with the SQL to add them; mismatched tenant databases refuse queries until migrated (re-checked every minute), or only log with `schema_check_strict_mode: false`
+- Session refresh no longer holds two DB connections at once, which deadlocked the pool at `connection_pool_size` concurrent refreshes
+- Signing-key lookups during token minting no longer open a nested transaction
+- Signing-key cache refresh is single-flight; readers serve the still-valid cached keys during rotation
+- Dashboard session expiry is now enforced at verification time (GHSA-w9fp-wv6g-pqv8)
+- Fixes the SAML login redirect when the IdP URL already contains a query string
+- Fixes config updates being wrongly rejected as conflicting when affected tenants inherit the changed values
+- Bulk import runs on a dedicated connection pool instead of borrowing from the live pool; failed chunks roll back to a savepoint and retries are bounded
+- Adds a regression test for the duplicate signing-key race on concurrent rotation (fixed in postgresql-plugin 9.8.0)
+- Corrects the 12.1.0 migration note: the `session_info` columns are a manual step
+- Updates the OTel javaagent to 2.29.0 and pins httpclient5/httpcore5 (CVE fixes)
+- Upgrades the embedded Tomcat to 11.0.25 to clear three critical CVEs (CVE-2026-65182, CVE-2026-65905, CVE-2026-68525)
+
+### Migration
+
+Applied automatically at startup (PostgreSQL >= 14). On large deployments already running 9.7.x, run
+the postgresql-plugin's `migration-scripts/v9.8.0.sql` ahead of the upgrade so the first dashboard
+search doesn't wait on it (safe to run online; `ANALYZE` samples the table, it does not scan it):
+
+```sql
+CREATE STATISTICS IF NOT EXISTS st_recipe_user_tenants_search_domain
+  ON (lower(split_part(account_info_value, '@', 2))) FROM recipe_user_tenants;
+CREATE STATISTICS IF NOT EXISTS st_recipe_user_tenants_search_tparty
+  ON (lower(account_info_value)) FROM recipe_user_tenants;
+ANALYZE recipe_user_tenants;
+```
+
+## [12.1.1]
+
+- In-memory (SQLite) dashboard user search (`getUsers_new`) now mirrors the postgresql storage's sargable prefix arms and adds matching partial indexes on `recipe_user_tenants`.
+
+### Migration
+
+Created/swapped automatically at startup; on large `recipe_user_tenants` tables pre-create them with
+`CREATE INDEX CONCURRENTLY` before upgrading to avoid a lock (note the transient two-index window on the account-info
+family). Canonical script: supertokens-postgresql-plugin
+[`migration-scripts/v9.7.1.sql`](https://github.com/supertokens/supertokens-postgresql-plugin/blob/master/migration-scripts/v9.7.1.sql)
+(run with psql autocommit, not in one transaction).
+
+```sql
+-- opclass swap of the account-info index (create the successor concurrently, then drop the predecessor)
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_recipe_user_tenants_account_info_pattern ON recipe_user_tenants
+  (app_id, tenant_id, account_info_type, account_info_value text_pattern_ops);
+DROP INDEX CONCURRENTLY IF EXISTS idx_recipe_user_tenants_account_info;
+-- partial indexes for the email-domain and case-insensitive provider arms
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_recipe_user_tenants_search_domain ON recipe_user_tenants
+  (app_id, tenant_id, lower(split_part(account_info_value, '@', 2)) text_pattern_ops)
+  WHERE account_info_type = 'email';
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_recipe_user_tenants_search_tparty ON recipe_user_tenants
+  (app_id, tenant_id, lower(account_info_value) text_pattern_ops)
+  WHERE account_info_type = 'tparty';
+```
+
+## [12.1.0]
+
+- Support for CDI version `5.6`
+- Updated plugin interface version to `9.0`
+- Adds `refresh_token_rotation_grace_period` config (seconds, default 30, range 0-300, app-level): how long the
+  previously active refresh token remains accepted after a rotation
+- Adds `access_token_validity_jitter` config (fraction, default 0.05, range 0-0.25, app-level): access token validity
+  is randomly shortened by up to this fraction when minted at session creation and refresh (never lengthened; token
+  regeneration keeps the original expiry); set to 0 to disable
+- Adds `recent_token_reuse_behaviour` config (`TOKEN_THEFT` (default) | `UNAUTHORISED`, config.yaml only): how reuse
+  of a recently rotated-out refresh token is reported; the session is revoked regardless
+- On CDI >= 5.6, session refresh rotates the refresh token within the refresh transaction, accepts the previous token
+  during the grace period, and revokes the session on reuse outside it
+- On CDI >= 5.6, `POST /recipe/session` and `POST /recipe/session/refresh` accept an optional shorten-only
+  `accessTokenValidity` (milliseconds) override for the minted access token; out-of-range values are rejected with 400
+- On CDI >= 5.6, session verification is stateless: `/recipe/session/verify` never writes to the database or returns
+  a replacement access token, and reports stored-payload changes via `payloadUpdateAvailable` when `checkDatabase` is
+  set
+- On CDI >= 5.6, `/recipe/session/verify` can only be called from the public tenant
+- Adds an opt-in `allowApproximate=true` query param to `GET /users/count` (CDI 5.6) serving a cached per-tenant
+  count plus a live delta, with new `approximate` / `asOf` response fields; default behavior is unchanged
+- Test-only: the 1M-user stress-test suite seeds OAuth data and measures the OAuth-dependent paths
+- Test-only: the 1M-user stress-test suite runs a separate leg per migration mode (LEGACY and MIGRATED)
+- Test-only: pins the token-regeneration invariants (in-place re-issue, DB-only update for expired input, no
+  rotation-state access)
+
+### Migration
+
+**Manual step required — NOT applied automatically.** The core only creates tables that do not exist yet
+(`CREATE TABLE IF NOT EXISTS`); it never adds columns to an existing table. On any database created by a core older
+than 12.1.0, run the following **before** starting the new core (from 12.1.2 the core detects the missing
+columns at startup: with the default `schema_check_strict_mode: true` it **refuses to start** until they exist,
+with `false` it logs them and session APIs fail with a schema-mismatch message pointing at the logs;
+12.1.0/12.1.1 start silently and fail every session API with `column prev_refresh_token_hash_2 does not exist`):
+
+```sql
+ALTER TABLE session_info ADD COLUMN IF NOT EXISTS prev_refresh_token_hash_2 VARCHAR(128);
+ALTER TABLE session_info ADD COLUMN IF NOT EXISTS refresh_token_rotated_at BIGINT;
+```
+
+Both columns are nullable; no backfill is required. The new `oauth_m2m_token_stats` rollup table *is* created
+automatically at startup (the legacy `oauth_m2m_tokens` table drains via the existing 31-day retention sweep).
+
+## [12.0.10]
+
+- fixes a SAML XML Signature Wrapping authentication bypass
+- adds additive indexes and smaller DB optimizations to speed up user listing, counting and other oauth session revocation. **Operators of large deployments should pre-create these indexes with
+`CREATE INDEX CONCURRENTLY` before upgrading** 
+
+### Migration
+
+Adds additive indexes, created on fresh databases and backfilled on
+existing ones at startup via
+
+``` sql
+
+CREATE INDEX IF NOT EXISTS idx_recipe_user_account_infos_app_primary_user ON recipe_user_account_infos 
+(app_id, primary_user_id);
+
+CREATE INDEX IF NOT EXISTS idx_recipe_user_account_infos_account_info ON recipe_user_account_infos 
+(app_id, account_info_type, account_info_value);
+
+CREATE INDEX IF NOT EXISTS oauth_session_client_id_index on oauth_sessions (app_id, client_id);
+
+CREATE INDEX IF NOT EXISTS oauth_session_session_handle_index on oauth_sessions (app_id, session_handle);
+```
+
+No table or column changes. **Operators of large deployments should pre-create these indexes with
+`CREATE INDEX CONCURRENTLY` before upgrading**, so the startup DDL is a no-op and does not hold a table lock
+during a long index build.
+
+## [12.0.9]
+
+- Enforces the 31-day activity log retention on the in-memory (SQLite) store via a direct delete in the
+  partition maintenance hook (it previously kept entries for the lifetime of the process)
+- Fixes user pagination truncating (newest-first) or never terminating (oldest-first) after bulk-importing linked
+  users whose per-method `time_joined` values diverge. Bulk import now normalizes each linked group's
+  `primary_or_recipe_user_time_joined` to the group's `MIN(time_joined)` after all login methods are inserted,
+  restoring the keyset-pagination invariant (see supertokens-core#1347)
+- Adds `updateTimeJoinedForPrimaryUsers_Transaction` to `AuthRecipeSQLStorage`
+- Fixes bulk import endlessly retrying users whose external user ID is already mapped; such imports now fail with `E031`
+- Test-only: the 1M-user stress-test suite now records non-OK results per seeding step and fails the run at the end if
+  any step errored, and its workflow can be triggered manually via `workflow_dispatch`
+- Test-only: the 1M-user stress-test suite now measures the scale-sensitive query paths (paginated listing, user
+  counts, dashboard search, third-party sign-in, linked-user email/phone updates, tenant association, account
+  link-check/unlink/delete, active-user counts, feature-flag usage stats, role listing/deletion, TOTP verification with
+  many used codes, and email-verification/delete for id-mapped users) against the 1M-user state, renders them in the
+  workflow "Stress Test Results" table, and fails the run when a step exceeds an env-overridable per-step duration
+  budget
+- Test-only: the 1M-user stress-test suite now harvests `pg_stat_statements` — snapshotting the ingest profile when
+  seeding finishes (then resetting) and the steady-state read/query profile at the end — renders per-phase tables (top
+  statements by total execution time and every statement that spilled to temp) into `stats.json` and the workflow step
+  summary, and fails the run when a read-phase statement writes more than an env-overridable number of temp blocks
+- Test-only: the 1M-user stress-test suite now runs the measured read-path steps at two dataset sizes (a ~100k-user
+  checkpoint mid-seed and the full 1M) and asserts the per-step cost ratio `time(1M)/time(100k)` against an
+  env-overridable per-class bound (O(1) steps ≤ 3×, O(n) steps ≤ 15×) — a hardware-independent check for superlinear
+  scaling that the absolute duration budgets can't catch; the small/large/ratio columns are rendered in the workflow
+  "Stress Test Results" table and the run fails when a step's ratio exceeds its bound
+  (default 10k ≈ 80 MB)
+- Test-only: the 1M-user stress-test suite now enforces per-step duration budgets as hard timeouts (each measured step
+  is raced against its budget, so a hung step fails the run at its budget with the step name instead of hanging until
+  the job timeout) and guards the pagination full-walk steps against non-termination and silent truncation (aborting on
+  a repeated pagination token or a runaway page count, and asserting the walk visited the whole dataset within 1% of the
+  tenant's user count); timed-out and failed steps are recorded in `stats.json` and surfaced in the workflow "Stress
+  Test Results" table with their failure reason, and `supertokens-node` is pinned to an exact version for
+  reproducibility
+- Test-only: the 1M-user stress-test suite now runs the measured read-path steps collect-and-continue — a guard
+  violation, timeout or thrown error records that step as failed and the run moves on to the next step instead of
+  aborting at the first failure, so one run surfaces every read-path failure at once (seeding failures stay immediately
+  fatal). A timed-out step is now aborted cooperatively (the pagination walk checks the step's abort signal each
+  iteration and stops issuing requests) so it can't keep hitting the core and polluting later measurements; a step that
+  failed on one of the two dataset sizes reports its scaling ratio as `n/a`; steps that ran after an earlier failure are
+  flagged in the "Stress Test Results" table as possibly tainted; the pagination completeness-guard failure now reports
+  the terminal page's pagination token and first/last `(timeJoined, userId)`; and an end-of-run stage fails the job
+  listing every failed step
+
+### Migration
+
+Adds three additive indexes, created on fresh databases and backfilled on existing ones at startup via
+
+``` sql
+
+CREATE INDEX IF NOT EXISTS idx_recipe_user_tenants_tenant_recipe_user on recipe_user_tenants (app_id, tenant_id, 
+recipe_user_id);
+
+CREATE INDEX IF NOT EXISTS app_id_to_user_id_linked_flag_index on app_id_to_user_id (app_id, user_id, 
+is_linked_or_is_a_primary_user);
+
+CREATE INDEX IF NOT EXISTS idx_primary_user_tenants_tenant_primary on primary_user_tenants (app_id, tenant_id, 
+primary_user_id);
+
+```
+
+No table or column changes. **Operators of very large deployments should pre-create these three indexes with
+`CREATE INDEX CONCURRENTLY` before upgrading**, so the startup DDL is a no-op and does not hold a table lock
+during a long index build.
+
+## [12.0.8]
+
+- Security improvements around api-key/ip allow list handling
+- Adds `supertokens_min_cdi_version` config to reject requests using a CDI version below a configured minimum
+- Adds CDI 5.5: webauthn sign-in options are single-use — consumed atomically on successful sign in (replay returns
+  `OPTIONS_NOT_FOUND_ERROR`); requests on CDI <= 5.4 are unaffected. Requires SDKs on CDI 5.5 to verify each assertion
+  exactly once (see supertokens-core#1195)
+- Adds `removeOptions_Transaction` to `WebAuthNSQLStorage` (plugin-interface addition; needs a plugin-interface version
+  bump at release)
+- Fixes OAuth2 response code in case of malformed/invalid input (e.g. missing `client_id` or `redirect_uri`) to be 400
+  instead of 500
+- Optimizes Bulk Import to not create a separate connection pool when there is no work to be done
+- Optimizes MAU counting query
+
+## [12.0.7]
+
+- Fix no-op account info updates
+
+## [12.0.6]
+
+- Upgrade dependencies to go beyond known CVE's.
+- Test-only: the migration-mode variants of the account-linking test skip the in-memory storage, which does not
+  honor `migration_mode` from config (hardcoded `MIGRATED`); mode-dependent coverage for that flow runs in the
+  postgresql matrix
+
+## [12.0.5]
+
+- Fixes otel init without java agent (with the fresh otel sdk)
+- Resolves the OTel service name from ECS container metadata when available
+- Fixes a 12.0.0 regression of `linkAccounts` to be idempotent when the recipe user is already the target primary user:
+  in non-`LEGACY` migration modes this case now returns `accountsAlreadyLinked=true` (matching pre-12.0 and `LEGACY` behaviour)
+  instead of throwing `CannotLinkSinceRecipeUserIdAlreadyLinkedWithAnotherPrimaryUserIdException`
+- The `migration_mode` transition to `MIGRATED` now also requires the backfill completeness scan
+  (`verifyBackfillCompleteness`) to report zero inconsistent users, in addition to `pendingUsers == 0`, so users
+  missing reservation rows can no longer be stranded once reads leave the old tables
+- Changing `migration_mode` on an existing tenant (via the multitenancy CRUD endpoint) now takes effect on the
+  live storage instance without a core restart
+- Users signed up while `migration_mode` is `LEGACY` are no longer permanently skipped by the reservation-tables
+  backfill
+
+## [12.0.4]
+
+- Fixes an issue with deleting user-id mapped users
+
+## [12.0.3]
+
+- Adds an append-only `activity_log` audit log; a `user_last_active` event is now written to it whenever a user's last-active timestamp is updated
+- Adds the `CleanupActivityLogPartitions` cron that maintains the `activity_log` month-partitions (pre-creates upcoming months, drops a partition once its whole month is older than 31 days)
+- Removes the external `AuditLogSink` plugin mechanism
+
+### Migration
+
+The `activity_log` table DDL is in [SCHEMA-REWORK.md](SCHEMA-REWORK.md#pre-flight).
+
+## [12.0.2]
+
+- Fix: Protection against SAML XML signature wrapping (XSW) attack.
+
+## [12.0.1]
+
+- Fix: Allow new CUDs to be created as MIGRATED
+
+## [12.0.0]
+
+- Fix: SAML attribute values with `xsi:type="xsd:string"` are no longer silently dropped
+- Fix: SAML email extraction now checks `mail` and `email` claim attributes in addition to the WS-Federation URI claim and NameID
+- Fix: fixes permission issues with the installer's jre
+- Fix: upgrade embedded tomcat and the OTEL related libs because of security vulnerabilities
+
+- Lowers default transaction isolation level from SERIALIZABLE to READ_COMMITTED
+- Adds per-tenant `migration_mode` config with a state-machine validator for staged schema migration
+- Adds `BackfillReservationTables` cron job for online backfill
+- Adds `GET /migration/mode` and `GET /migration/backfill/progress` operator endpoints
+- Adds offline migration SQL scripts in `supertokens-postgresql-plugin/migration-scripts/`
+- Rewrites conflict detection for `makePrimaryUser`, `linkAccounts`, and `updateEmail` using `LockedUser` interfaces
+- Throttles `user_last_active` upserts on session refresh
+- Storages now warm up in parallel during boot
+
+### Migration
+
+See [SCHEMA-REWORK.md](SCHEMA-REWORK.md) for the operator runbook; the full schema DDL is in its [Pre-flight](SCHEMA-REWORK.md#pre-flight) section.
+
+## [11.4.4]
+
+- Fix: adds the otel-javaagent to the installed distribution
+- Fix: validate licenseKey field to reject misspelled or malformed input
+
+## [11.4.3]
+
+- Fix: uses the right transaction isolation level with oauth2 refresh tokens to avoid false-positive conflicts at DB
+  level
+
+## [11.4.2]
+
+- Fixes Tenant/App/CUD APIs to not to lock the whole world for a read
+- Fixes concurrency issue with oauth refresh tokens
 
 ## [11.4.1]
 

@@ -1,0 +1,286 @@
+name: Release Branch Tests
+
+on:
+  push:
+    branches:
+      - '[0-9]+.[0-9]+'
+  pull_request:
+    types: [opened, synchronize, reopened, labeled]
+
+jobs:
+  dependency-branches:
+    name: Resolve dependencies
+    # Run for: pushes to release branches, PRs targeting release branches, or PRs with 'run-tests' label
+    if: >-
+      github.event_name == 'push'
+      || contains(github.event.pull_request.labels.*.name, 'run-tests')
+      || contains(github.base_ref, '.')
+    runs-on: ubuntu-22.04
+    outputs:
+      branches: ${{ steps.result.outputs.branches }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: supertokens/get-core-dependencies-action@main
+        id: result
+        with:
+          run-for: PR
+          core-branch: ${{ github.head_ref || github.ref_name }}
+
+  # ── Update dependency manifests if needed ────────────────────────
+  update-deps:
+    name: Update dependency manifests
+    needs: dependency-branches
+    runs-on: ubuntu-22.04
+    outputs:
+      deps_changed: ${{ steps.check.outputs.changed }}
+    steps:
+      - name: Set up JDK 21.0.7
+        uses: actions/setup-java@v5
+        with:
+          java-version: 21.0.7
+          distribution: zulu
+
+      - name: Checkout supertokens-root
+        uses: actions/checkout@v5
+        with:
+          repository: supertokens/supertokens-root
+          path: supertokens-root
+          ref: master
+
+      - name: Checkout supertokens-core
+        uses: actions/checkout@v5
+        with:
+          path: supertokens-root/supertokens-core
+          token: ${{ secrets.GH_TOKEN || github.token }}
+          ref: ${{ github.head_ref }}
+
+      - name: Checkout supertokens-plugin-interface
+        uses: actions/checkout@v5
+        with:
+          repository: supertokens/supertokens-plugin-interface
+          path: supertokens-root/supertokens-plugin-interface
+          ref: ${{ fromJson(needs.dependency-branches.outputs.branches)['plugin-interface'] }}
+          token: ${{ secrets.GH_TOKEN || github.token }}
+
+      - name: Checkout supertokens-postgresql-plugin
+        uses: actions/checkout@v5
+        with:
+          repository: supertokens/supertokens-postgresql-plugin
+          path: supertokens-root/supertokens-postgresql-plugin
+          ref: ${{ fromJson(needs.dependency-branches.outputs.branches)['postgresql'] }}
+          token: ${{ secrets.GH_TOKEN || github.token }}
+
+      - name: Load modules
+        run: |
+          cd supertokens-root
+          cat > modules.txt <<'EOF'
+          core,master
+          plugin-interface,master
+          postgresql-plugin,master
+          EOF
+          ./loadModules
+
+      - name: Generate dependency manifests
+        run: |
+          cd supertokens-root
+          ./gradlew generateDependenciesJson
+
+      - name: Check for changes and push
+        id: check
+        run: |
+          changed=false
+
+          for repo_dir in supertokens-root/supertokens-core supertokens-root/supertokens-plugin-interface supertokens-root/supertokens-postgresql-plugin; do
+            if [ ! -d "$repo_dir/.git" ]; then
+              continue
+            fi
+
+            pushd "$repo_dir" > /dev/null
+
+            # Stage any changed implementationDependencies.json files
+            find . -name 'implementationDependencies.json' -not -path './.git/*' -exec git add {} +
+
+            if ! git diff --cached --quiet; then
+              changed=true
+              echo "::group::implementationDependencies.json diff in $repo_dir"
+              git diff --cached
+              echo "::endgroup::"
+              git config user.name "github-actions[bot]"
+              git config user.email "github-actions[bot]@users.noreply.github.com"
+              git commit -m "chore: update implementationDependencies.json"
+              git push
+              echo "Pushed updated implementationDependencies.json in $repo_dir"
+            fi
+
+            popd > /dev/null
+          done
+
+          echo "changed=$changed" >> "$GITHUB_OUTPUT"
+
+  # ── Unit tests (sqlite + postgresql) ──────────────────────────────
+  test:
+    name: Tests (${{ matrix.plugin }})
+    needs: [dependency-branches, update-deps]
+    if: needs.update-deps.outputs.deps_changed == 'false'
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        plugin:
+          - sqlite
+          - postgresql
+
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: root
+          POSTGRES_PASSWORD: root
+          POSTGRES_DB: root
+        ports:
+          - 5432:5432
+        options: >-
+          --name postgres
+          --health-cmd "pg_isready -U root"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+
+    steps:
+      - name: Set up JDK 21.0.7
+        uses: actions/setup-java@v5
+        with:
+          java-version: 21.0.7
+          distribution: zulu
+
+      - name: Checkout supertokens-root
+        uses: actions/checkout@v5
+        with:
+          repository: supertokens/supertokens-root
+          path: supertokens-root
+          ref: master
+
+      - name: Checkout supertokens-core
+        uses: actions/checkout@v5
+        with:
+          path: supertokens-root/supertokens-core
+
+      - name: Checkout supertokens-plugin-interface
+        uses: actions/checkout@v5
+        with:
+          repository: supertokens/supertokens-plugin-interface
+          path: supertokens-root/supertokens-plugin-interface
+          ref: ${{ fromJson(needs.dependency-branches.outputs.branches)['plugin-interface'] }}
+
+      - name: Checkout supertokens-postgresql-plugin
+        if: matrix.plugin == 'postgresql'
+        uses: actions/checkout@v5
+        with:
+          repository: supertokens/supertokens-postgresql-plugin
+          path: supertokens-root/supertokens-postgresql-plugin
+          ref: ${{ fromJson(needs.dependency-branches.outputs.branches)['postgresql'] }}
+
+      - name: Load modules
+        run: |
+          cd supertokens-root
+          cat > modules.txt <<'EOF'
+          core,master
+          plugin-interface,master
+          ${{ matrix.plugin }}-plugin,master
+          EOF
+          ./loadModules
+
+      - name: Configure PostgreSQL
+        if: matrix.plugin == 'postgresql'
+        env:
+          PGHOST: localhost
+          PGPORT: "5432"
+          PGUSER: root
+          PGPASSWORD: root
+        run: |
+          # GHA service containers don't support passing server args in YAML, so we
+          # apply max_connections via ALTER SYSTEM and restart the container.
+          psql -d root -c "ALTER SYSTEM SET max_connections = 1000;"
+          docker restart postgres
+          until pg_isready -h localhost -U root; do sleep 1; done
+
+      - name: Create PostgreSQL test databases
+        if: matrix.plugin == 'postgresql'
+        env:
+          PGHOST: localhost
+          PGPORT: "5432"
+          PGUSER: root
+          PGPASSWORD: root
+        run: |
+          for db in supertokens $(seq -f 'st%.0f' 0 50); do
+            psql -d root -c "CREATE DATABASE \"$db\";" 2>/dev/null || true
+          done
+          # Also pre-create worker-specific databases for parallel test workers.
+          # maxParallelForks = availableProcessors(); create for up to 8 workers to be safe.
+          for w in $(seq 1 8); do
+            for n in $(seq 0 50); do
+              psql -d root -c "CREATE DATABASE \"st${n}_w${w}\";" 2>/dev/null || true
+            done
+          done
+
+      - name: Setup test environment
+        run: cd supertokens-root && ./utils/setupTestEnv --local
+
+      - name: Run tests
+        env:
+          ST_PLUGIN_NAME: ${{ matrix.plugin }}
+          TEST_PG_ADMIN_DB: root
+          TEST_PG_HOST: localhost
+        run: |
+          cd supertokens-root
+          ./gradlew test
+
+      - name: Publish test report
+        uses: mikepenz/action-junit-report@v6
+        if: always()
+        with:
+          report_paths: '**/build/test-results/test/TEST-*.xml'
+          detailed_summary: true
+          include_passed: false
+          annotate_notice: true
+
+  # ── Wait for the dev Docker image to be published ─────────────────
+  wait-for-docker:
+    name: Wait for Docker image
+    needs: [dependency-branches, update-deps]
+    if: github.repository == 'supertokens/supertokens-core' && needs.update-deps.outputs.deps_changed == 'false'
+    runs-on: ubuntu-22.04
+    outputs:
+      tag: ${{ steps.set_tag.outputs.TAG }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+      - name: Wait for Docker build
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # For PR events GITHUB_SHA is the synthetic merge commit, not the branch
+          # HEAD that triggered the Docker publish workflow. Use the PR head SHA when
+          # available, falling back to GITHUB_SHA for direct push events.
+          COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: python .github/helpers/wait-for-docker.py
+      - name: Set image tag
+        id: set_tag
+        env:
+          # publish-dev-docker.yml builds on branch push and tags the image with the branch name.
+          # On pull_request events GITHUB_REF is the merge ref (refs/pull/N/merge), which would
+          # produce a tag like "refs_pull_N_merge" that was never pushed. Derive the tag from the
+          # PR's source branch (head_ref) instead — falling back to ref_name for push events —
+          # and sanitise it the same way (slashes -> underscores) so it matches the pushed image.
+          BRANCH_NAME: ${{ github.head_ref || github.ref_name }}
+        run: |
+          echo "TAG=$(echo "$BRANCH_NAME" | sed 's/\//_/g')" >> "$GITHUB_OUTPUT"
+
+  # ── Stress tests (uses the published Docker image) ────────────────
+  stress-tests:
+    name: Stress tests
+    needs: [test, wait-for-docker]
+    uses: ./.github/workflows/stress-tests.yml
+    with:
+      tag: ${{ needs.wait-for-docker.outputs.tag }}

@@ -35,10 +35,12 @@ import java.io.IOException;
 import java.net.MalformedURLException;
 import java.net.URL;
 import java.net.URLClassLoader;
+import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.ServiceLoader;
+import java.util.Set;
 
 public class FeatureFlag extends ResourceDistributor.SingletonResource {
 
@@ -94,6 +96,15 @@ public class FeatureFlag extends ResourceDistributor.SingletonResource {
 
     private FeatureFlag(Main main, AppIdentifier appIdentifier) {
         this.main = main;
+        if (Main.isTesting) {
+            Set<String> failForApps = FeatureFlagTestContent.getInstance(main)
+                    .getValue(FeatureFlagTestContent.FAIL_CONSTRUCTOR_FOR_APPS);
+            if (failForApps != null && failForApps.contains(appIdentifier.getAppId())) {
+                // Simulate a transient construction failure with a null-message exception, which also
+                // exercises the null-message path in Logging.error.
+                throw new RuntimeException();
+            }
+        }
         this.eeFeatureFlag = getNewEEFeatureFlagInterfaceInstance(main, appIdentifier);
     }
 
@@ -126,40 +137,37 @@ public class FeatureFlag extends ResourceDistributor.SingletonResource {
 
     public static void loadForAllTenants(Main main, List<AppIdentifier> apps,
                                          List<TenantIdentifier> tenantsThatChanged) {
-        try {
-            main.getResourceDistributor().withResourceDistributorLock(() -> {
-                Map<ResourceDistributor.KeyClass, ResourceDistributor.SingletonResource> existingResources =
-                        main.getResourceDistributor()
-                                .getAllResourcesWithResourceKey(RESOURCE_KEY);
-                main.getResourceDistributor().clearAllResourcesWithResourceKey(RESOURCE_KEY);
-                for (AppIdentifier app : apps) {
-                    try {
-                        ResourceDistributor.SingletonResource resource = existingResources.get(
-                                new ResourceDistributor.KeyClass(
-                                        app,
-                                        RESOURCE_KEY));
-                        if (resource != null && !tenantsThatChanged.contains(app.getAsPublicTenantIdentifier())) {
-                            main.getResourceDistributor()
-                                    .setResource(app,
-                                            RESOURCE_KEY,
-                                            resource);
-                        } else {
-                            main.getResourceDistributor()
-                                    .setResource(
-                                            app,
-                                            RESOURCE_KEY,
-                                            new FeatureFlag(main, app));
-                        }
-                    } catch (Exception e) {
-                        Logging.error(main, app.getAsPublicTenantIdentifier(), e.getMessage(), false);
-                        // continue loading other resources
-                    }
+        Map<ResourceDistributor.KeyClass, ResourceDistributor.SingletonResource> existingResources =
+                main.getResourceDistributor()
+                        .getAllResourcesWithResourceKey(RESOURCE_KEY);
+        Map<ResourceDistributor.KeyClass, ResourceDistributor.SingletonResource> newResources =
+                new HashMap<>();
+        for (AppIdentifier app : apps) {
+            ResourceDistributor.KeyClass key = new ResourceDistributor.KeyClass(app, RESOURCE_KEY);
+            ResourceDistributor.SingletonResource existing = existingResources.get(key);
+            if (existing != null && !tenantsThatChanged.contains(app.getAsPublicTenantIdentifier())) {
+                newResources.put(key, existing);
+                continue;
+            }
+            try {
+                newResources.put(key, new FeatureFlag(main, app));
+            } catch (Exception e) {
+                // Constructing the FeatureFlag resource for this app failed. Keep the app's previous
+                // resource (if any) instead of dropping it, otherwise replaceResourcesWithResourceKey
+                // would wipe it and every later /ee/license call and feature gate would throw
+                // TenantOrAppNotFoundException. Log with the stack trace (5-arg overload) so a
+                // recurrence is diagnosable.
+                Logging.error(main, app.getAsPublicTenantIdentifier(),
+                        "Failed to (re)load FeatureFlag for app; " +
+                                (existing != null ? "keeping previous instance" : "app will have no FeatureFlag"),
+                        true, e);
+                if (existing != null) {
+                    newResources.put(key, existing);
                 }
-                return null;
-            });
-        } catch (ResourceDistributor.FuncException e) {
-            throw new IllegalStateException("should never happen", e);
+                // continue loading other resources
+            }
         }
+        main.getResourceDistributor().replaceResourcesWithResourceKey(RESOURCE_KEY, newResources);
     }
 
     public EE_FEATURES[] getEnabledFeatures() throws StorageQueryException, TenantOrAppNotFoundException {
