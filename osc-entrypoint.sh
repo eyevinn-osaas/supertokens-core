@@ -41,7 +41,14 @@ cp /opt/supertokens/config.yaml "$CONFIG_FILE"
 
 chown -R supertokens:supertokens "$TEMP_DIR" 2>/dev/null || true
 
-exec gosu supertokens /opt/supertokens/jre/bin/java \
+# gosu is not present in newer base images; fall back to setpriv
+if command -v gosu >/dev/null 2>&1; then
+    DROP="gosu supertokens"
+else
+    DROP="setpriv --reuid=supertokens --regid=supertokens --init-groups"
+fi
+
+exec $DROP /opt/supertokens/jre/bin/java \
     -classpath "/opt/supertokens/core/*:/opt/supertokens/plugin-interface/*:/opt/supertokens/ee/*" \
     io.supertokens.Main \
     /opt/supertokens \
